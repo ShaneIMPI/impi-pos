@@ -76,6 +76,7 @@ select.field-input{appearance:none;background-image:url("data:image/svg+xml,%3Cs
 .badge-orange{background:rgba(230,126,34,.15);color:#e67e22;border:1px solid rgba(230,126,34,.3);}
 .badge-red{background:rgba(192,57,43,.15);color:#c0392b;border:1px solid rgba(192,57,43,.3);}
 .badge-gold{background:rgba(201,168,76,.15);color:#c9a84c;border:1px solid rgba(201,168,76,.4);}
+.badge-blue{background:rgba(59,157,214,.15);color:#3b9dd6;border:1px solid rgba(59,157,214,.4);}
 
 .size-chip{background:var(--steel);border:2px solid var(--border);border-radius:6px;padding:8px 14px;
   font-size:14px;font-weight:700;color:var(--text);cursor:pointer;transition:all .15s;min-width:64px;
@@ -514,7 +515,7 @@ function ProductModal({ product, stock, onClose, onAdd }) {
 }
 
 // ─── Cart Panel Content ───────────────────────────────────────────────────────
-function CartContent({ cart, updateQty, removeItem, client, setClient, onComplete }) {
+function CartContent({ cart, updateQty, removeItem, client, setClient, paymentMethod, setPaymentMethod, onComplete }) {
   const total = cart.reduce((s,i)=>s+i.price*i.qty,0);
 
   return (
@@ -544,6 +545,18 @@ function CartContent({ cart, updateQty, removeItem, client, setClient, onComplet
           <span>TOTAL</span><span className="mono">{fmt(total)}</span>
         </div>
       </div>
+      <p className="sec-label" style={{marginBottom:8}}>Payment Method</p>
+      <div style={{display:"flex",gap:8,marginBottom:16}}>
+        {[["cash","💵 Cash"],["card","💳 Card"]].map(([key,label])=>(
+          <button key={key} onClick={()=>setPaymentMethod(key)}
+            style={{flex:1,padding:"12px 0",borderRadius:4,fontWeight:800,fontSize:14,letterSpacing:1,
+              border:`2px solid ${paymentMethod===key?"#c9a84c":"#333"}`,
+              background:paymentMethod===key?"#c9a84c":"#181818",
+              color:paymentMethod===key?"#000":"#888"}}>
+            {label}
+          </button>
+        ))}
+      </div>
       <p className="sec-label" style={{marginBottom:8}}>Client Details</p>
       <div className="client-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:8,marginBottom:12}}>
         {[["name","Name *","text"],["company","Company","text"],["email","Email","email"],["phone","Phone","tel"]].map(([k,lbl,t])=>(
@@ -571,6 +584,7 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
   const [search, setSearch] = useState("");
   const [modalProd, setModalProd] = useState(null);
   const [client, setClient] = useState({name:"",company:"",email:"",phone:""});
+  const [paymentMethod, setPaymentMethod] = useState("cash");
   const [drawer, setDrawer] = useState(false);
 
   const filtered = stock.filter(p =>
@@ -604,9 +618,9 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
   const completeSale = async () => {
     if (!client.name.trim()) { toast("✗ Client name is required","error"); return; }
     if (!cart.length) { toast("✗ Cart is empty","error"); return; }
-    const result = await onCompleteSale(cart, client);
+    const result = await onCompleteSale(cart, client, paymentMethod);
     if (!result.ok) return; // blocked (e.g. insufficient stock) — leave cart as-is so the cashier can fix it
-    setCart([]); setClient({name:"",company:"",email:"",phone:""}); setDrawer(false);
+    setCart([]); setClient({name:"",company:"",email:"",phone:""}); setPaymentMethod("cash"); setDrawer(false);
     onSaleComplete(result.inv);
   };
 
@@ -649,7 +663,7 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
         {/* Cart panel (desktop) */}
         <div className="cart-panel" style={{padding:20,overflowY:"auto",background:"#0d0d0d"}}>
           <CartContent cart={cart} updateQty={updateQty} removeItem={removeItem}
-            client={client} setClient={setClient} onComplete={completeSale} />
+            client={client} setClient={setClient} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} onComplete={completeSale} />
         </div>
       </div>
 
@@ -682,7 +696,7 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
               <button onClick={()=>setDrawer(false)} style={{background:"none",border:"none",color:"#666",fontSize:22}}>✕</button>
             </div>
             <CartContent cart={cart} updateQty={updateQty} removeItem={removeItem}
-              client={client} setClient={setClient} onComplete={completeSale} />
+              client={client} setClient={setClient} paymentMethod={paymentMethod} setPaymentMethod={setPaymentMethod} onComplete={completeSale} />
           </div>
         </div>
       )}
@@ -741,6 +755,7 @@ td{padding:10px 8px;border-bottom:1px solid #ddd;font-size:14px;}
     <div class="mono" style="font-size:20px;font-weight:700;color:#c9a84c;">${invoice.id}</div>
     <div style="font-size:13px;color:#555;margin-top:4px;">Date: ${invoice.date}</div>
     <div style="font-size:13px;color:#555;">Cashier: ${invoice.cashier}</div>
+    <div style="font-size:13px;color:#555;">Payment: ${invoice.paymentMethod==="card"?"Card":"Cash"}</div>
   </div>
 </div>
 <div style="background:#f8f8f8;border:1px solid #ddd;border-radius:4px;padding:12px 16px;margin-bottom:24px;font-size:14px;">
@@ -802,6 +817,7 @@ ${TEST_MODE?'<div class="watermark">⚠ TEST DOCUMENT — NOT A VALID TAX INVOIC
             <div className="mono" style={{fontSize:20,fontWeight:700,color:"#c9a84c",marginTop:4}}>{invoice.id}</div>
             <div style={{fontSize:13,color:"#555",marginTop:6}}>Date: {invoice.date}</div>
             <div style={{fontSize:13,color:"#555"}}>Cashier: {invoice.cashier}</div>
+            <div style={{fontSize:13,color:"#555"}}>Payment: {invoice.paymentMethod==="card"?"Card":"Cash"}</div>
           </div>
         </div>
 
@@ -1004,8 +1020,9 @@ function Adjustments({ stock, user, toast, log, refreshAll }) {
       toast(`✓ Adjustment applied — ${selProd.category} ${size}: ${before} → ${after}`,"success");
       setQty(""); setNote("");
     } catch (err) {
+      console.error("Adjustment failed:", err);
       if (isStockError(err)) toast(`✗ Not enough stock — only ${before} on hand`,"error");
-      else toast(`✗ Couldn't save — check your connection`,"error");
+      else toast(`✗ Couldn't save — ${err?.message || "unknown error"}`,"error");
     }
     setSaving(false);
   };
@@ -1100,8 +1117,9 @@ function StockTake({ stock, user, toast, refreshAll }) {
       await refreshAll();
       setCommitted(true);
       toast(`✓ Stock take committed — ${checked.length} lines updated at ${timeStr()}`,"success");
-    } catch {
-      toast("✗ Couldn't commit — check your connection and try again","error");
+    } catch (err) {
+      console.error("Stock take failed:", err);
+      toast(`✗ Couldn't commit — ${err?.message || "unknown error"}`,"error");
     }
     setSaving(false);
   };
@@ -1195,7 +1213,7 @@ function SalesScreen({ sales, onView }) {
   return (
     <div style={{padding:24}}>
       <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16,marginBottom:28}}>
-        {[{l:"INVOICES",v:String(sales.length)},{l:"REVENUE (INCL. VAT)",v:fmt(rev)},{l:"UNITS SOLD",v:String(units)}].map(c=>(
+        {[{l:"INVOICES",v:String(sales.length)},{l:"REVENUE",v:fmt(rev)},{l:"UNITS SOLD",v:String(units)}].map(c=>(
           <div key={c.l} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:8,padding:"20px 24px"}}>
             <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:8}}>{c.l}</div>
             <div className="mono" style={{fontSize:28,fontWeight:700,color:"#c9a84c"}}>{c.v}</div>
@@ -1220,6 +1238,9 @@ function SalesScreen({ sales, onView }) {
                   <span style={{color:"#d0d0c8",fontSize:14,flex:1}}>
                     {sale.client.name}{sale.client.company?` (${sale.client.company})`:""}</span>
                   <span style={{color:"#888",fontSize:13}}>{u} item{u!==1?"s":""}</span>
+                  <span className={`badge ${sale.paymentMethod==="card"?"badge-blue":"badge-green"}`} style={{fontSize:10}}>
+                    {sale.paymentMethod==="card"?"💳 CARD":"💵 CASH"}
+                  </span>
                   <span className="mono" style={{color:"#c9a84c",fontWeight:700}}>{fmt(sale.total)}</span>
                   <span style={{color:"#666",fontSize:12,fontWeight:700,letterSpacing:1}}>VIEW →</span>
                 </div>
@@ -1263,14 +1284,19 @@ function buildReconciliation(openingData, closingStock, closingSales) {
 
   const soldMap = {};
   const cashierMap = {};
+  const paymentMap = { cash:{units:0,revenue:0,invoices:0}, card:{units:0,revenue:0,invoices:0} };
   newSales.forEach(sale => {
     cashierMap[sale.cashier] = cashierMap[sale.cashier] || { units:0, revenue:0, invoices:0 };
     cashierMap[sale.cashier].revenue += sale.total;
     cashierMap[sale.cashier].invoices += 1;
+    const pm = sale.paymentMethod==="card" ? "card" : "cash";
+    paymentMap[pm].revenue += sale.total;
+    paymentMap[pm].invoices += 1;
     sale.items.forEach(item => {
       const k = stockKey(item);
       soldMap[k] = (soldMap[k]||0) + item.qty;
       cashierMap[sale.cashier].units += item.qty;
+      paymentMap[pm].units += item.qty;
     });
   });
 
@@ -1289,7 +1315,7 @@ function buildReconciliation(openingData, closingStock, closingSales) {
   }), {depleted:0,sold:0,variance:0});
   const revenue = newSales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, cashierMap, newSalesCount: newSales.length };
+  return { rows, totals, revenue, cashierMap, paymentMap, newSalesCount: newSales.length };
 }
 
 function Reconcile({ stock, sales, toast }) {
@@ -1320,6 +1346,8 @@ function Reconcile({ stock, sales, toast }) {
       <td class="right" style="font-weight:700;${r.variance!==0?'color:#c0392b;':''}">${r.variance}</td></tr>`).join("");
     const cashierHtml = Object.entries(result.cashierMap).map(([name,c])=>
       `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+    const paymentHtml = Object.entries(result.paymentMap).map(([method,c])=>
+      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
     const html = `<!DOCTYPE html><html><head><title>Stock Reconciliation</title><style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;}
@@ -1335,7 +1363,10 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <p style="margin-bottom:4px;"><strong>Total units depleted from stock:</strong> ${result.totals.depleted}</p>
 <p style="margin-bottom:4px;"><strong>Total units recorded as sold:</strong> ${result.totals.sold}</p>
 <p style="margin-bottom:4px;"><strong>Variance:</strong> ${result.totals.variance} ${result.totals.variance!==0?"⚠ investigate":"✓ matches"}</p>
-<p style="margin-bottom:20px;"><strong>Revenue recorded (incl. VAT):</strong> ${fmt(result.revenue)}</p>
+<p style="margin-bottom:20px;"><strong>Revenue recorded:</strong> ${fmt(result.revenue)}</p>
+<h2 style="font-weight:700;color:#111;">By payment method</h2>
+<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
+<tbody>${paymentHtml}</tbody></table>
 <h2 style="font-weight:700;color:#111;">By staff member</h2>
 <table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
 <tbody>${cashierHtml}</tbody></table>
@@ -1404,6 +1435,26 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
               padding:"10px 18px",fontSize:14,fontWeight:700,marginBottom:24}}>
             🖨 Print / Save Report
           </button>
+
+          <p className="sec-label" style={{marginBottom:10}}>By Payment Method</p>
+          <div style={{overflowX:"auto",marginBottom:28}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{["Method","Invoices","Units","Revenue"].map((h,i)=>(
+                <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
+                  color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>0?"right":"left"}}>{h}</th>
+              ))}</tr></thead>
+              <tbody>
+                {Object.entries(result.paymentMap).map(([method,c])=>(
+                  <tr key={method}>
+                    <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#d0d0c8"}}>{method==="card"?"💳 Card":"💵 Cash"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.invoices}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.units}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#c9a84c",fontWeight:700}}>{fmt(c.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
 
           <p className="sec-label" style={{marginBottom:10}}>By Staff Member</p>
           <div style={{overflowX:"auto",marginBottom:28}}>
@@ -1501,7 +1552,7 @@ export default function App() {
     let anySynced = false;
     for (const entry of [...q]) {
       try {
-        const newId = await completeSaleRPC(entry.cashier, entry.client, entry.items, entry.subtotal, entry.vat, entry.total, entry.testMode);
+        const newId = await completeSaleRPC(entry.cashier, entry.client, entry.items, entry.subtotal, entry.vat, entry.total, entry.testMode, entry.paymentMethod);
         q = removeFromQueue(entry.tempId);
         setQueueCount(q.length);
         setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, id:newId, pending:false} : s));
@@ -1556,8 +1607,9 @@ export default function App() {
       await wipeAllDataRPC();
       await refreshAll();
       toast("✓ All shared data cleared — backup downloaded, starting fresh", "success");
-    } catch {
-      toast("✗ Couldn't reset — check your connection and try again", "error");
+    } catch (err) {
+      console.error("Reset failed:", err);
+      toast(`✗ Couldn't reset — ${err?.message || "unknown error"}`, "error");
     }
   };
 
@@ -1566,7 +1618,7 @@ export default function App() {
   // atomically checks and decrements stock (this is what stops two devices
   // both "selling" the last unit). Offline: completes locally and queues for
   // automatic sync — see flushQueue above.
-  const completeSaleFlow = async (cart, client) => {
+  const completeSaleFlow = async (cart, client, paymentMethod) => {
     const sub = cart.reduce((s,i)=>s+i.price*i.qty,0);
     const vatAmt = sub*VAT_RATE;
     const total = sub+vatAmt;
@@ -1574,9 +1626,9 @@ export default function App() {
     const itemsSnap = cart.map(({cartId,...rest})=>rest);
 
     try {
-      const newId = await completeSaleRPC(user.username, clientSnap, itemsSnap, sub, vatAmt, total, TEST_MODE);
+      const newId = await completeSaleRPC(user.username, clientSnap, itemsSnap, sub, vatAmt, total, TEST_MODE, paymentMethod);
       await refreshAll();
-      const inv = { id:newId, date:dateStr(), cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE };
+      const inv = { id:newId, date:dateStr(), cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE };
       toast(`✓ Sale complete — Invoice ${inv.id}`, "success");
       return { ok:true, inv };
     } catch (err) {
@@ -1585,13 +1637,13 @@ export default function App() {
         return { ok:false };
       }
       const tempId = `PENDING-${Date.now()}`;
-      const inv = { id:tempId, date:dateStr(), cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE, pending:true };
+      const inv = { id:tempId, date:dateStr(), cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE, pending:true };
       setStock(prev=>prev.map(p=>({...p,variants:p.variants.map(v=>{
         const ci = itemsSnap.find(c=>c.variantId===v.id);
         return ci ? {...v, qty:Math.max(0, v.qty-ci.qty)} : v;
       })})));
       setSales(prev=>[...prev, inv]);
-      pushToQueue({ tempId, cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE });
+      pushToQueue({ tempId, cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE });
       setQueueCount(loadQueue().length);
       setOnline(false);
       toast(`⚠ No connection — saved locally as ${tempId}, will sync automatically once back online`, "error");

@@ -33,7 +33,7 @@ export async function fetchAllData() {
     });
   });
   const salesOut = (sales||[]).map(s => ({
-    id:s.id, date:s.date, cashier:s.cashier, client:s.client||{}, testMode:s.test_mode,
+    id:s.id, date:s.date, cashier:s.cashier, client:s.client||{}, testMode:s.test_mode, paymentMethod:s.payment_method||"cash",
     items: itemsBySale[s.id]||[], subtotal:Number(s.subtotal), vat:Number(s.vat), total:Number(s.total),
   }));
 
@@ -86,11 +86,11 @@ export async function setStockTakeRPC(variantId, newQty, cashier) {
   return data;
 }
 
-export async function completeSaleRPC(cashier, client, items, subtotal, vat, total, testMode) {
+export async function completeSaleRPC(cashier, client, items, subtotal, vat, total, testMode, paymentMethod) {
   const { data, error } = await supabase.rpc("complete_sale", {
     p_cashier: cashier, p_client: client,
     p_items: items.map(i=>({ variant_id:i.variantId, product_id:i.productId, category:i.category, sku:i.sku, size:i.size, qty:i.qty, price:i.price })),
-    p_subtotal: subtotal, p_vat: vat, p_total: total, p_test_mode: !!testMode,
+    p_subtotal: subtotal, p_vat: vat, p_total: total, p_test_mode: !!testMode, p_payment_method: paymentMethod||"cash",
   });
   if (error) throw error;
   return data; // new invoice id
