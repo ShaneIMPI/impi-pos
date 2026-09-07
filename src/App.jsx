@@ -1,27 +1,34 @@
 const TEST_MODE = false; // LIVE — Seamless Africa 2026: real IMPI-#### invoices
 
 import { useState, useEffect, useCallback } from "react";
+import { SUPABASE_CONFIGURED } from "./supabase.js";
+import {
+  fetchAllData, subscribeRealtime, addProduct as addProductAPI,
+  applyAdjustmentRPC, setStockTakeRPC, completeSaleRPC, wipeAllDataRPC,
+  isStockError, loadQueue, pushToQueue, removeFromQueue,
+} from "./sync.js";
 
 // ─── Constants ────────────────────────────────────────────────────────────────
-const VAT_RATE = 0.15;
+const VAT_RATE = 0; // IMPI does not charge VAT on PPE sales
 const BASE = import.meta.env.BASE_URL; // correct logo path whether run locally or under a GitHub Pages subfolder
 
-// ─── Local persistence (keeps stock/sales/invoice numbers safe across refreshes,
-//     tab closes, and laptop restarts — this laptop's browser only) ────────────
-const LS_KEY = "impi_pos_v1";
-const loadSaved = () => {
+// ─── Local cache (fallback only) ───────────────────────────────────────────────
+// The shared Supabase backend is the source of truth for every device. This
+// local cache exists purely so the app still shows last-known data if it's
+// opened while offline — it is overwritten by the server every time a fetch
+// succeeds, and is never treated as authoritative when online.
+const LS_KEY = "impi_pos_cache_v2";
+const loadCache = () => {
   try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; }
   catch { return {}; }
 };
-const SAVED = loadSaved();
-
-let invCounter = SAVED.invCounter || 1001;
-const nextInvNo = () => `${TEST_MODE ? "TEST" : "IMPI"}-${invCounter++}`;
-const persist = (stock, sales, adjLog) => {
-  try {
-    localStorage.setItem(LS_KEY, JSON.stringify({ stock, sales, adjLog, invCounter, savedAt: new Date().toISOString() }));
-  } catch (e) { console.error("Save failed — storage may be full", e); }
+const CACHE = loadCache();
+const saveCache = (stock, sales, adjLog) => {
+  try { localStorage.setItem(LS_KEY, JSON.stringify({ stock, sales, adjLog, savedAt: new Date().toISOString() })); }
+  catch (e) { console.error("Cache save failed", e); }
 };
+const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(()=>fn(...a), ms); }; };
+
 const fmt = n => `R ${Number(n).toFixed(2).replace(/\B(?=(\d{3})+(?!\d))/g, ",")}`;
 const dateStr = () => new Date().toLocaleDateString("en-ZA", { day: "2-digit", month: "short", year: "numeric" });
 const timeStr = () => new Date().toLocaleTimeString("en-ZA", { hour: "2-digit", minute: "2-digit" });
@@ -32,6 +39,7 @@ const ADMINS = [
 
 const INITIAL_STOCK = [];
 // Add your real products via the app's Stock → Add Product screen, per event.
+
 
 // ─── Global CSS ───────────────────────────────────────────────────────────────
 const GLOBAL_CSS = `
@@ -343,7 +351,7 @@ function LoginScreen({ onLogin }) {
 
 // ─── Header ───────────────────────────────────────────────────────────────────
 function downloadBackup(stock, sales, adjLog) {
-  const blob = new Blob([JSON.stringify({ stock, sales, adjLog, invCounter, exportedAt: new Date().toISOString() }, null, 2)],
+  const blob = new Blob([JSON.stringify({ stock, sales, adjLog, exportedAt: new Date().toISOString() }, null, 2)],
     { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -353,7 +361,7 @@ function downloadBackup(stock, sales, adjLog) {
   URL.revokeObjectURL(url);
 }
 
-function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onResetAll }) {
+function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onResetAll, online, queueCount, syncIssuesCount }) {
   const navItems = [
     { key:"pos",   icon:"⚡", label:"POS" },
     { key:"stock", icon:"📦", label:"Stock", admin:true },
@@ -372,6 +380,18 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onRes
         </div>
       </div>
       <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
+        <span title={online?"Connected — every device sees this data live":"No connection — sales are being saved locally and will sync automatically"}
+          style={{display:"flex",alignItems:"center",gap:6,fontSize:12,fontWeight:700,color:online?"#27ae60":"#e67e22",
+            border:`1px solid ${online?"#27ae60":"#e67e22"}`,borderRadius:20,padding:"5px 12px"}}>
+          <span style={{width:8,height:8,borderRadius:"50%",background:online?"#27ae60":"#e67e22",display:"inline-block"}}/>
+          {online ? "LIVE" : `OFFLINE${queueCount?` · ${queueCount} PENDING`:""}`}
+        </span>
+        {syncIssuesCount>0 && (
+          <span title="Sales that couldn't sync due to a stock conflict — needs manual review"
+            style={{fontSize:12,fontWeight:700,color:"#c0392b",border:"1px solid #c0392b",borderRadius:20,padding:"5px 12px"}}>
+            ⚠ {syncIssuesCount} SYNC ISSUE{syncIssuesCount>1?"S":""}
+          </span>
+        )}
         {navItems.map(n => (
           <button key={n.key}
             onClick={() => setScreen(n.key)}
@@ -393,7 +413,7 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onRes
           </button>
         )}
         {user.role==="admin" && (
-          <button onClick={onResetAll} title="Wipe all stock, sales and adjustment history on this laptop (auto-backs-up first)"
+          <button onClick={onResetAll} title="Wipe the SHARED stock, sales and adjustment history for every connected device (auto-backs-up first)"
             style={{background:"#222",color:"#c0392b",border:"1px solid #c0392b",borderRadius:4,
               padding:"8px 12px",fontWeight:700,fontSize:13,letterSpacing:1}}>
             🗑 RESET
@@ -433,7 +453,7 @@ function ProductModal({ product, stock, onClose, onAdd }) {
     if (!entries.length) return;
     onAdd(entries.map(([size,qty])=>{
       const v = prod.variants.find(vv=>vv.size===size);
-      return {productId:prod.id,category:prod.category,sku:prod.sku,size,qty,price:v.price};
+      return {productId:prod.id,variantId:v.id,category:prod.category,sku:prod.sku,size,qty,price:v.price};
     }), totalUnits);
     onClose();
   };
@@ -495,9 +515,7 @@ function ProductModal({ product, stock, onClose, onAdd }) {
 
 // ─── Cart Panel Content ───────────────────────────────────────────────────────
 function CartContent({ cart, updateQty, removeItem, client, setClient, onComplete }) {
-  const sub = cart.reduce((s,i)=>s+i.price*i.qty,0);
-  const vat = sub*VAT_RATE;
-  const total = sub+vat;
+  const total = cart.reduce((s,i)=>s+i.price*i.qty,0);
 
   return (
     <div>
@@ -522,12 +540,6 @@ function CartContent({ cart, updateQty, removeItem, client, setClient, onComplet
           </div>
       }
       <div style={{borderTop:"1px solid #333",paddingTop:10,marginBottom:16}}>
-        <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#888",marginBottom:4}}>
-          <span>Subtotal (excl. VAT)</span><span className="mono">{fmt(sub)}</span>
-        </div>
-        <div style={{display:"flex",justifyContent:"space-between",fontSize:13,color:"#888",marginBottom:8}}>
-          <span>VAT 15%</span><span className="mono">{fmt(vat)}</span>
-        </div>
         <div style={{display:"flex",justifyContent:"space-between",fontSize:20,fontWeight:900,color:"#c9a84c"}}>
           <span>TOTAL</span><span className="mono">{fmt(total)}</span>
         </div>
@@ -554,7 +566,7 @@ function CartContent({ cart, updateQty, removeItem, client, setClient, onComplet
 }
 
 // ─── POS Screen ───────────────────────────────────────────────────────────────
-function POSScreen({ stock, setStock, user, toast, onSaleComplete }) {
+function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
   const [cart, setCart] = useState([]);
   const [search, setSearch] = useState("");
   const [modalProd, setModalProd] = useState(null);
@@ -589,20 +601,13 @@ function POSScreen({ stock, setStock, user, toast, onSaleComplete }) {
   };
   const removeItem = cartId => setCart(p=>p.filter(i=>i.cartId!==cartId));
 
-  const completeSale = () => {
+  const completeSale = async () => {
     if (!client.name.trim()) { toast("✗ Client name is required","error"); return; }
     if (!cart.length) { toast("✗ Cart is empty","error"); return; }
-    setStock(prev=>prev.map(p=>({...p,variants:p.variants.map(v=>{
-      const ci=cart.find(c=>c.productId===p.id&&c.size===v.size);
-      return ci?{...v,qty:Math.max(0,v.qty-ci.qty)}:v;
-    })})));
-    const sub = cart.reduce((s,i)=>s+i.price*i.qty,0);
-    const vat = sub*VAT_RATE;
-    const inv = {id:nextInvNo(),date:dateStr(),cashier:user.username,client:{...client},
-      items:[...cart],subtotal:sub,vat,total:sub+vat};
+    const result = await onCompleteSale(cart, client);
+    if (!result.ok) return; // blocked (e.g. insufficient stock) — leave cart as-is so the cashier can fix it
     setCart([]); setClient({name:"",company:"",email:"",phone:""}); setDrawer(false);
-    toast(`✓ Sale complete — Invoice ${inv.id}`,"success");
-    onSaleComplete(inv);
+    onSaleComplete(result.inv);
   };
 
   const getStatus = p => {
@@ -748,14 +753,12 @@ td{padding:10px 8px;border-bottom:1px solid #ddd;font-size:14px;}
 </table>
 <table style="max-width:300px;margin-left:auto;">
 <tbody>
-<tr><td>Subtotal (excl. VAT)</td><td class="right mono">${fmt(invoice.subtotal)}</td></tr>
-<tr><td>VAT 15%</td><td class="right mono">${fmt(invoice.vat)}</td></tr>
-<tr><td style="border-top:2px solid #111;padding-top:8px;font-weight:900;font-size:16px;">TOTAL DUE</td>
-    <td class="right mono" style="border-top:2px solid #111;padding-top:8px;font-weight:900;font-size:16px;color:#c9a84c;">${fmt(invoice.total)}</td></tr>
+<tr><td style="font-weight:900;font-size:16px;">TOTAL DUE</td>
+    <td class="right mono" style="font-weight:900;font-size:16px;color:#c9a84c;">${fmt(invoice.total)}</td></tr>
 </tbody>
 </table>
 <p style="margin-top:28px;font-size:13px;color:#777;">Thank you for your purchase<br/>
-IMPI RMS (Pty) Ltd · VAT Reg: 4120277498 · Co. Reg: 2017/099360/07 · PSIRA: 2689596</p>
+IMPI RMS (Pty) Ltd · Co. Reg: 2017/099360/07 · PSIRA: 2689596</p>
 ${TEST_MODE?'<div class="watermark">⚠ TEST DOCUMENT — NOT A VALID TAX INVOICE</div>':""}
 <script>window.print();<\/script>
 </body></html>`;
@@ -835,19 +838,15 @@ ${TEST_MODE?'<div class="watermark">⚠ TEST DOCUMENT — NOT A VALID TAX INVOIC
         <div style={{display:"flex",justifyContent:"flex-end"}}>
           <table style={{minWidth:290}}>
             <tbody>
-              <tr><td style={{padding:"4px 8px",fontSize:13,color:"#555"}}>Subtotal (excl. VAT)</td>
-                  <td className="mono" style={{padding:"4px 8px",textAlign:"right"}}>{fmt(invoice.subtotal)}</td></tr>
-              <tr><td style={{padding:"4px 8px",fontSize:13,color:"#555"}}>VAT 15%</td>
-                  <td className="mono" style={{padding:"4px 8px",textAlign:"right"}}>{fmt(invoice.vat)}</td></tr>
-              <tr><td style={{padding:"10px 8px 4px",fontSize:18,fontWeight:900,borderTop:"2px solid #111"}}>TOTAL DUE</td>
-                  <td className="mono" style={{padding:"10px 8px 4px",fontSize:18,fontWeight:900,textAlign:"right",color:"#c9a84c",borderTop:"2px solid #111"}}>{fmt(invoice.total)}</td></tr>
+              <tr><td style={{padding:"4px 8px",fontSize:18,fontWeight:900}}>TOTAL DUE</td>
+                  <td className="mono" style={{padding:"4px 8px",fontSize:18,fontWeight:900,textAlign:"right",color:"#c9a84c"}}>{fmt(invoice.total)}</td></tr>
             </tbody>
           </table>
         </div>
 
         <div style={{marginTop:28,fontSize:13,color:"#777",borderTop:"1px solid #eee",paddingTop:14}}>
           Thank you for your purchase<br/>
-          IMPI RMS (Pty) Ltd · VAT Reg: 4120277498 · Co. Reg: 2017/099360/07 · PSIRA: 2689596
+          IMPI RMS (Pty) Ltd · Co. Reg: 2017/099360/07 · PSIRA: 2689596
         </div>
         {TEST_MODE&&(
           <div style={{marginTop:20,background:"#ffeeee",border:"2px solid #c0392b",borderRadius:4,
@@ -907,23 +906,33 @@ function ViewStock({ stock }) {
 }
 
 // ─── Add Product ──────────────────────────────────────────────────────────────
-function AddProduct({ stock, setStock, toast }) {
+function AddProduct({ toast, refreshAll }) {
   const [cat, setCat] = useState("");
   const [sku, setSku] = useState("");
   const [variants, setVariants] = useState([{size:"",price:"",qty:""}]);
+  const [saving, setSaving] = useState(false);
 
   const addRow = () => setVariants(p=>[...p,{size:"",price:"",qty:""}]);
   const delRow = i => setVariants(p=>p.filter((_,idx)=>idx!==i));
   const upd = (i,f,v) => setVariants(p=>p.map((r,idx)=>idx===i?{...r,[f]:v}:r));
   const previewQty = variants.reduce((s,v)=>s+(parseInt(v.qty)||0),0);
 
-  const save = () => {
+  const save = async () => {
     if (!cat.trim()) { toast("✗ Category name is required","error"); return; }
     if (!sku.trim()) { toast("✗ SKU is required","error"); return; }
     const valid = variants.filter(v=>v.size&&v.price);
     if (!valid.length) { toast("✗ At least one variant required","error"); return; }
-    setStock(p=>[...p,{id:Date.now(),category:cat.trim(),sku:sku.trim().toUpperCase(),
-      variants:valid.map(v=>({size:v.size,price:parseFloat(v.price)||0,qty:parseInt(v.qty)||0}))}]);
+    setSaving(true);
+    try {
+      await addProductAPI(cat.trim(), sku.trim().toUpperCase(),
+        valid.map(v=>({size:v.size,price:parseFloat(v.price)||0,qty:parseInt(v.qty)||0})));
+      await refreshAll();
+    } catch (err) {
+      setSaving(false);
+      toast(`✗ Couldn't save — check your connection (${err.message||"unknown error"})`, "error");
+      return;
+    }
+    setSaving(false);
     toast(`✓ ${cat.trim()} added to inventory — ${valid.length} variant${valid.length>1?"s":""}`, "success");
     setCat(""); setSku(""); setVariants([{size:"",price:"",qty:""}]);
   };
@@ -959,40 +968,46 @@ function AddProduct({ stock, setStock, toast }) {
           </div>
         </div>
       )}
-      <button onClick={save}
-        style={{background:"linear-gradient(135deg,#FFD700,#c9a84c)",color:"#000",fontWeight:900,
+      <button onClick={save} disabled={saving}
+        style={{background:saving?"#555":"linear-gradient(135deg,#FFD700,#c9a84c)",color:saving?"#999":"#000",fontWeight:900,
           fontSize:16,letterSpacing:2,textTransform:"uppercase",padding:"13px 28px",border:"none",borderRadius:4}}>
-        Save Product
+        {saving?"Saving…":"Save Product"}
       </button>
     </div>
   );
 }
 
 // ─── Adjustments ─────────────────────────────────────────────────────────────
-function Adjustments({ stock, setStock, user, toast, log, setLog }) {
+function Adjustments({ stock, user, toast, log, refreshAll }) {
   const [prodId, setProdId] = useState("");
   const [size, setSize] = useState("");
   const [adjType, setAdjType] = useState("Receive");
   const [qty, setQty] = useState("");
   const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
 
   const adjTypes = [{key:"Receive",icon:"➕"},{key:"Write-off",icon:"➖"},{key:"Free Issue",icon:"🎁"},{key:"Return",icon:"↩"}];
-  const selProd = stock.find(p=>p.id===parseInt(prodId));
+  const selProd = stock.find(p=>p.id===prodId);
   const selVariant = selProd?.variants.find(v=>v.size===size);
 
-  const apply = () => {
+  const apply = async () => {
     if (!prodId||!size||!qty) { toast("✗ Select product, size and quantity","error"); return; }
     const n = parseInt(qty);
     if (!n||n<1) { toast("✗ Invalid quantity","error"); return; }
+    if (!selVariant?.id) { toast("✗ Select a valid product and size","error"); return; }
     const delta = (adjType==="Write-off"||adjType==="Free Issue") ? -n : n;
-    const before = selVariant?.qty||0;
-    const after = Math.max(0,before+delta);
-    setStock(p=>p.map(pr=>pr.id!==parseInt(prodId)?pr:{...pr,
-      variants:pr.variants.map(v=>v.size!==size?v:{...v,qty:after})}));
-    setLog(p=>[{id:Date.now(),ts:`${dateStr()} ${timeStr()}`,product:selProd.category,
-      size,delta,adjType,note:note.trim(),cashier:user.username,before,after},...p].slice(0,500));
-    toast(`✓ Adjustment applied — ${selProd.category} ${size}: ${before} → ${after}`,"success");
-    setQty(""); setNote("");
+    const before = selVariant.qty;
+    setSaving(true);
+    try {
+      const after = await applyAdjustmentRPC(selVariant.id, delta, adjType, note.trim(), user.username);
+      await refreshAll();
+      toast(`✓ Adjustment applied — ${selProd.category} ${size}: ${before} → ${after}`,"success");
+      setQty(""); setNote("");
+    } catch (err) {
+      if (isStockError(err)) toast(`✗ Not enough stock — only ${before} on hand`,"error");
+      else toast(`✗ Couldn't save — check your connection`,"error");
+    }
+    setSaving(false);
   };
 
   return (
@@ -1030,10 +1045,10 @@ function Adjustments({ stock, setStock, user, toast, log, setLog }) {
           <label className="sec-label">Note / Reason (optional)</label>
           <input className="field-input" placeholder="e.g. Received from supplier" value={note} onChange={e=>setNote(e.target.value)} />
         </div>
-        <button onClick={apply}
-          style={{background:"linear-gradient(135deg,#FFD700,#c9a84c)",color:"#000",fontWeight:900,
+        <button onClick={apply} disabled={saving}
+          style={{background:saving?"#555":"linear-gradient(135deg,#FFD700,#c9a84c)",color:saving?"#999":"#000",fontWeight:900,
             fontSize:16,letterSpacing:2,textTransform:"uppercase",padding:"13px 28px",border:"none",borderRadius:4}}>
-          Apply Adjustment
+          {saving?"Applying…":"Apply Adjustment"}
         </button>
       </div>
       <div>
@@ -1062,9 +1077,10 @@ function Adjustments({ stock, setStock, user, toast, log, setLog }) {
 }
 
 // ─── Stock Take ───────────────────────────────────────────────────────────────
-function StockTake({ stock, setStock, toast }) {
+function StockTake({ stock, user, toast, refreshAll }) {
   const [counts, setCounts] = useState({});
   const [committed, setCommitted] = useState(false);
+  const [saving, setSaving] = useState(false);
   const setCount = (pid,size,val) => setCounts(p=>({...p,[`${pid}-${size}`]:val}));
 
   const allLines = stock.flatMap(p=>p.variants.map(v=>({pid:p.id,cat:p.category,size:v.size,sys:v.qty})));
@@ -1073,13 +1089,21 @@ function StockTake({ stock, setStock, toast }) {
   const deficit = variances.filter(v=>v<0).reduce((s,v)=>s+v,0);
   const surplus = variances.filter(v=>v>0).reduce((s,v)=>s+v,0);
 
-  const commit = () => {
-    setStock(p=>p.map(pr=>({...pr,variants:pr.variants.map(v=>{
-      const raw=counts[`${pr.id}-${v.size}`];
-      return (raw===undefined||raw==="")?v:{...v,qty:Math.max(0,parseInt(raw)||0)};
-    })})));
-    setCommitted(true);
-    toast(`✓ Stock take committed — ${checked.length} lines updated at ${timeStr()}`,"success");
+  const commit = async () => {
+    setSaving(true);
+    try {
+      await Promise.all(checked.map(l => {
+        const variant = stock.find(p=>p.id===l.pid)?.variants.find(v=>v.size===l.size);
+        const newQty = Math.max(0, parseInt(counts[`${l.pid}-${l.size}`])||0);
+        return setStockTakeRPC(variant.id, newQty, user.username);
+      }));
+      await refreshAll();
+      setCommitted(true);
+      toast(`✓ Stock take committed — ${checked.length} lines updated at ${timeStr()}`,"success");
+    } catch {
+      toast("✗ Couldn't commit — check your connection and try again","error");
+    }
+    setSaving(false);
   };
 
   return (
@@ -1130,18 +1154,18 @@ function StockTake({ stock, setStock, toast }) {
           {(deficit!==0||surplus!==0)&&")"}
         </span>
       </div>
-      <button onClick={commit} disabled={committed||!checked.length}
-        style={{background:committed||!checked.length?"#333":"#27ae60",
-          color:committed||!checked.length?"#555":"#fff",fontWeight:900,fontSize:16,
+      <button onClick={commit} disabled={committed||!checked.length||saving}
+        style={{background:committed||!checked.length||saving?"#333":"#27ae60",
+          color:committed||!checked.length||saving?"#555":"#fff",fontWeight:900,fontSize:16,
           letterSpacing:2,textTransform:"uppercase",padding:"13px 28px",border:"none",borderRadius:4}}>
-        {committed?"✓ Committed":"✓ Commit Stock Take"}
+        {committed?"✓ Committed":saving?"Committing…":"✓ Commit Stock Take"}
       </button>
     </div>
   );
 }
 
 // ─── Stock Screen ─────────────────────────────────────────────────────────────
-function StockScreen({ stock, setStock, user, toast, adjLog, setAdjLog }) {
+function StockScreen({ stock, user, toast, adjLog, refreshAll }) {
   const [tab, setTab] = useState("view");
   const tabs = [{key:"view",label:"📦 View Stock"},{key:"add",label:"➕ Add Product"},{key:"adjust",label:"🔧 Adjustments"},{key:"take",label:"📋 Stock Take"}];
   return (
@@ -1157,9 +1181,9 @@ function StockScreen({ stock, setStock, user, toast, adjLog, setAdjLog }) {
         ))}
       </div>
       {tab==="view"   &&<ViewStock stock={stock} />}
-      {tab==="add"    &&<AddProduct stock={stock} setStock={setStock} toast={toast} />}
-      {tab==="adjust" &&<Adjustments stock={stock} setStock={setStock} user={user} toast={toast} log={adjLog} setLog={setAdjLog} />}
-      {tab==="take"   &&<StockTake stock={stock} setStock={setStock} toast={toast} />}
+      {tab==="add"    &&<AddProduct toast={toast} refreshAll={refreshAll} />}
+      {tab==="adjust" &&<Adjustments stock={stock} user={user} toast={toast} log={adjLog} refreshAll={refreshAll} />}
+      {tab==="take"   &&<StockTake stock={stock} user={user} toast={toast} refreshAll={refreshAll} />}
     </div>
   );
 }
@@ -1435,11 +1459,14 @@ export default function App() {
   const [showHero, setShowHero]   = useState(true);
   const [user, setUser]           = useState(null);
   const [screen, setScreen]       = useState("pos");
-  const [stock, setStock]         = useState(()=>
-    SAVED.stock || INITIAL_STOCK.map(p=>({...p,variants:p.variants.map(v=>({...v}))})));
-  const [sales, setSales]         = useState(()=> SAVED.sales || []);
-  const [adjLog, setAdjLog]       = useState(()=> SAVED.adjLog || []);
+  const [stock, setStock]         = useState(()=> CACHE.stock || []);
+  const [sales, setSales]         = useState(()=> CACHE.sales || []);
+  const [adjLog, setAdjLog]       = useState(()=> CACHE.adjLog || []);
   const [invoice, setInvoice]     = useState(null);
+  const [loading, setLoading]     = useState(SUPABASE_CONFIGURED);
+  const [online, setOnline]       = useState(navigator.onLine);
+  const [queueCount, setQueueCount] = useState(loadQueue().length);
+  const [syncIssues, setSyncIssues] = useState([]);
   const { toasts, toast, dismiss } = useToast();
 
   useEffect(()=>{
@@ -1449,25 +1476,130 @@ export default function App() {
     return ()=>document.head.removeChild(s);
   },[]);
 
-  // Save to this browser's local storage every time stock, sales or the adjustment log change.
-  useEffect(()=>{ persist(stock, sales, adjLog); }, [stock, sales, adjLog]);
+  // Pull the full current dataset from the shared backend. This is the single
+  // source of truth for every device — local state always defers to this.
+  const refreshAll = useCallback(async () => {
+    if (!SUPABASE_CONFIGURED) return;
+    try {
+      const data = await fetchAllData();
+      setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog);
+      saveCache(data.stock, data.sales, data.adjLog);
+      setOnline(true);
+    } catch (err) {
+      console.error("Refresh failed", err);
+      setOnline(false);
+    }
+  }, []);
+
+  // Replays sales that were completed while offline, in order, the moment a
+  // connection is available. Genuine stock conflicts (someone else sold the
+  // last unit while this device was offline) are pulled out for manual review
+  // rather than silently dropped or silently forced through.
+  const flushQueue = useCallback(async () => {
+    let q = loadQueue();
+    if (!q.length) return;
+    let anySynced = false;
+    for (const entry of [...q]) {
+      try {
+        const newId = await completeSaleRPC(entry.cashier, entry.client, entry.items, entry.subtotal, entry.vat, entry.total, entry.testMode);
+        q = removeFromQueue(entry.tempId);
+        setQueueCount(q.length);
+        setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, id:newId, pending:false} : s));
+        toast(`✓ Synced ${entry.tempId} → ${newId}`, "success");
+        anySynced = true;
+      } catch (err) {
+        if (isStockError(err)) {
+          setSyncIssues(prev => [...prev, {...entry, error: err.message}]);
+          q = removeFromQueue(entry.tempId);
+          setQueueCount(q.length);
+          setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, pending:false, syncFailed:true} : s));
+          toast(`⚠ ${entry.tempId} couldn't sync — stock conflict, needs manual review`, "error");
+        } else {
+          break; // still offline — stop here, the rest will retry next pass
+        }
+      }
+    }
+    if (anySynced) refreshAll();
+  }, [refreshAll, toast]);
+
+  useEffect(() => {
+    if (!SUPABASE_CONFIGURED) { setLoading(false); return; }
+    let cancelled = false;
+    (async () => { await refreshAll(); if (!cancelled) setLoading(false); })();
+    const unsub = subscribeRealtime(debounce(refreshAll, 400));
+    const onOnline  = () => { setOnline(true); flushQueue(); };
+    const onOffline = () => setOnline(false);
+    window.addEventListener("online", onOnline);
+    window.addEventListener("offline", onOffline);
+    const interval = setInterval(() => { if (loadQueue().length) flushQueue(); }, 20000);
+    return () => {
+      cancelled = true;
+      unsub();
+      window.removeEventListener("online", onOnline);
+      window.removeEventListener("offline", onOffline);
+      clearInterval(interval);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const login  = u => { setUser(u); setScreen("pos"); };
   const logout = () => { setUser(null); setInvoice(null); setScreen("pos"); };
 
-  const resetAllData = () => {
+  const resetAllData = async () => {
     if (!window.confirm(
-      "This downloads a safety backup of everything first, then permanently clears all stock, " +
-      "sales and adjustment history from THIS browser (starting fresh for a new event). Continue?"
+      "This downloads a safety backup first, then PERMANENTLY WIPES the shared stock, sales and " +
+      "adjustment history for EVERY device connected to this app — not just this one. Use this to " +
+      "start a genuinely new event. Continue?"
     )) return;
     downloadBackup(stock, sales, adjLog);
-    localStorage.removeItem(LS_KEY);
-    invCounter = 1001;
-    setStock([]); setSales([]); setAdjLog([]);
-    toast("✓ All data cleared — backup downloaded, starting fresh", "success");
+    try {
+      await wipeAllDataRPC();
+      await refreshAll();
+      toast("✓ All shared data cleared — backup downloaded, starting fresh", "success");
+    } catch {
+      toast("✗ Couldn't reset — check your connection and try again", "error");
+    }
   };
 
-  const onSaleComplete = inv => { setSales(p=>[...p,inv]); setInvoice(inv); setScreen("invoice"); };
+  // The one place offline support actually matters: completing a sale never
+  // blocks the cashier. Online: goes straight to the shared backend, which
+  // atomically checks and decrements stock (this is what stops two devices
+  // both "selling" the last unit). Offline: completes locally and queues for
+  // automatic sync — see flushQueue above.
+  const completeSaleFlow = async (cart, client) => {
+    const sub = cart.reduce((s,i)=>s+i.price*i.qty,0);
+    const vatAmt = sub*VAT_RATE;
+    const total = sub+vatAmt;
+    const clientSnap = {...client};
+    const itemsSnap = cart.map(({cartId,...rest})=>rest);
+
+    try {
+      const newId = await completeSaleRPC(user.username, clientSnap, itemsSnap, sub, vatAmt, total, TEST_MODE);
+      await refreshAll();
+      const inv = { id:newId, date:dateStr(), cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE };
+      toast(`✓ Sale complete — Invoice ${inv.id}`, "success");
+      return { ok:true, inv };
+    } catch (err) {
+      if (isStockError(err)) {
+        toast(`✗ Not enough stock — ${String(err.message).replace("INSUFFICIENT_STOCK:","").trim()}. Adjust the cart and try again.`, "error");
+        return { ok:false };
+      }
+      const tempId = `PENDING-${Date.now()}`;
+      const inv = { id:tempId, date:dateStr(), cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE, pending:true };
+      setStock(prev=>prev.map(p=>({...p,variants:p.variants.map(v=>{
+        const ci = itemsSnap.find(c=>c.variantId===v.id);
+        return ci ? {...v, qty:Math.max(0, v.qty-ci.qty)} : v;
+      })})));
+      setSales(prev=>[...prev, inv]);
+      pushToQueue({ tempId, cashier:user.username, client:clientSnap, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE });
+      setQueueCount(loadQueue().length);
+      setOnline(false);
+      toast(`⚠ No connection — saved locally as ${tempId}, will sync automatically once back online`, "error");
+      return { ok:true, inv };
+    }
+  };
+
+  const onSaleComplete = inv => { setInvoice(inv); setScreen("invoice"); };
   const onViewInvoice  = inv => { setInvoice(inv); setScreen("invoice"); };
   const navTo = s => { setScreen(s); if(s!=="invoice") setInvoice(null); };
 
@@ -1481,6 +1613,25 @@ export default function App() {
     </>
   );
 
+  if (!SUPABASE_CONFIGURED) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0a0a",padding:24}}>
+      <div style={{maxWidth:480,textAlign:"center",color:"#d0d0c8"}}>
+        <h2 style={{color:"#c9a84c",marginBottom:12}}>⚠ Backend not configured</h2>
+        <p style={{fontSize:14,lineHeight:1.6}}>
+          This build is wired for shared, live-synced data across devices, but <code>src/supabase.js</code> still
+          has placeholder values. Run <code>supabase/schema.sql</code> in your Supabase project's SQL Editor, then
+          fill in <code>SUPABASE_URL</code> and <code>SUPABASE_ANON_KEY</code> in <code>src/supabase.js</code> and redeploy.
+        </p>
+      </div>
+    </div>
+  );
+
+  if (loading) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0a0a"}}>
+      <Logo h={90} glow center/>
+    </div>
+  );
+
   if (!user) return (
     <>
       <TestBanner/>
@@ -1492,14 +1643,15 @@ export default function App() {
   return (
     <>
       <TestBanner/>
-      <Header user={user} screen={activeNav} setScreen={navTo} onLogout={logout} stock={stock} sales={sales} adjLog={adjLog} onResetAll={resetAllData}/>
+      <Header user={user} screen={activeNav} setScreen={navTo} onLogout={logout} stock={stock} sales={sales}
+        adjLog={adjLog} onResetAll={resetAllData} online={online} queueCount={queueCount} syncIssuesCount={syncIssues.length}/>
       <Toasts toasts={toasts} dismiss={dismiss}/>
       {screen==="pos" &&
-        <POSScreen stock={stock} setStock={setStock} user={user} toast={toast} onSaleComplete={onSaleComplete}/>}
+        <POSScreen stock={stock} user={user} toast={toast} onCompleteSale={completeSaleFlow} onSaleComplete={onSaleComplete}/>}
       {screen==="invoice" && invoice &&
         <InvoiceView invoice={invoice} onBack={()=>{setInvoice(null);setScreen("pos");}}/>}
       {screen==="stock" && user.role==="admin" &&
-        <StockScreen stock={stock} setStock={setStock} user={user} toast={toast} adjLog={adjLog} setAdjLog={setAdjLog}/>}
+        <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} refreshAll={refreshAll}/>}
       {screen==="reconcile" && user.role==="admin" &&
         <Reconcile stock={stock} sales={sales} toast={toast}/>}
       {screen==="sales" && !invoice &&
@@ -1509,3 +1661,4 @@ export default function App() {
     </>
   );
 }
+
