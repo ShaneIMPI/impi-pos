@@ -1474,7 +1474,7 @@ function buildReconciliation(openingData, closingStock, closingSales) {
 // Straight "where do things stand right now" report — every sale currently on
 // record, cash/card and per-staff breakdowns, and current stock on hand.
 // Needs no opening backup, since it's not computing a before/after variance.
-function buildSummary(stock, sales) {
+function buildSummary(stock, sales, loans) {
   const soldMap = {};
   const cashierMap = {};
   const paymentMap = { cash:{units:0,revenue:0,invoices:0}, card:{units:0,revenue:0,invoices:0} };
@@ -1493,20 +1493,27 @@ function buildSummary(stock, sales) {
     });
   });
 
+  const openLoans = (loans||[]).filter(l=>l.status==="out");
+  const loanMap = {};
+  openLoans.forEach(l => {
+    const k = stockKey(l);
+    loanMap[k] = (loanMap[k]||0) + l.qty;
+  });
+
   const rows = [];
   stock.forEach(p => p.variants.forEach(v => {
     const k = stockKey({category:p.category, sku:p.sku, size:v.size});
-    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, remaining: v.qty });
+    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, remaining: v.qty, onLoan: loanMap[k]||0 });
   }));
   rows.sort((a,b)=> a.category.localeCompare(b.category) || a.size.localeCompare(b.size));
 
-  const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining }), {sold:0,remaining:0});
+  const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining, onLoan:t.onLoan+r.onLoan }), {sold:0,remaining:0,onLoan:0});
   const revenue = sales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, cashierMap, paymentMap, invoiceCount: sales.length };
+  return { rows, totals, revenue, cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
 }
 
-function Reconcile({ stock, sales, toast }) {
+function Reconcile({ stock, sales, loans, toast }) {
   const [mode, setMode] = useState("summary"); // "summary" (no file needed) | "variance" (opening vs closing)
   const [opening, setOpening] = useState(null);
   const [openingName, setOpeningName] = useState("");
@@ -1526,16 +1533,19 @@ function Reconcile({ stock, sales, toast }) {
   const closingSales = closingSource==="live" ? sales : closing?.sales;
   const ready = opening && closingStock && closingSales;
   const result = ready ? buildReconciliation(opening, closingStock, closingSales) : null;
-  const summary = mode==="summary" ? buildSummary(stock, sales) : null;
+  const summary = mode==="summary" ? buildSummary(stock, sales, loans) : null;
+  const openLoansList = (loans||[]).filter(l=>l.status==="out");
 
   const printSummary = () => {
     if (!summary) return;
     const rowsHtml = summary.rows.map(r=>
-      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.remaining}</td></tr>`).join("");
+      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.onLoan}</td><td class="right">${r.remaining}</td></tr>`).join("");
     const cashierHtml = Object.entries(summary.cashierMap).map(([name,c])=>
       `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
     const paymentHtml = Object.entries(summary.paymentMap).map(([method,c])=>
       `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+    const loansHtml = summary.openLoans.map(l=>
+      `<tr><td>${l.category}</td><td>${l.size}</td><td class="right">${l.qty}</td><td>${l.borrower}</td><td>${l.createdAt}</td><td>${l.note||""}</td></tr>`).join("");
     const html = `<!DOCTYPE html><html><head><title>Sales Summary</title><style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;}
@@ -1550,6 +1560,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <h2>As at ${new Date().toLocaleString("en-ZA")}</h2>
 <p style="margin-bottom:4px;"><strong>Invoices:</strong> ${summary.invoiceCount}</p>
 <p style="margin-bottom:4px;"><strong>Total units sold:</strong> ${summary.totals.sold}</p>
+<p style="margin-bottom:4px;"><strong>Total units currently on loan:</strong> ${summary.totals.onLoan}</p>
 <p style="margin-bottom:4px;"><strong>Total units remaining on hand:</strong> ${summary.totals.remaining}</p>
 <p style="margin-bottom:20px;"><strong>Total revenue:</strong> ${fmt(summary.revenue)}</p>
 <h2 style="font-weight:700;color:#111;">By payment method</h2>
@@ -1558,9 +1569,12 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <h2 style="font-weight:700;color:#111;">By staff member</h2>
 <table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
 <tbody>${cashierHtml}</tbody></table>
-<h2 style="font-weight:700;color:#111;">Stock sold vs. on hand</h2>
-<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">Remaining</th></tr></thead>
+<h2 style="font-weight:700;color:#111;">Stock sold vs. on loan vs. on hand</h2>
+<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">On Loan</th><th class="right">Remaining</th></tr></thead>
 <tbody>${rowsHtml}</tbody></table>
+${summary.openLoans.length>0?`<h2 style="font-weight:700;color:#111;">Currently on loan — reference</h2>
+<table><thead><tr><th>Category</th><th>Size</th><th class="right">Qty</th><th>Borrower</th><th>Booked Out</th><th>Note</th></tr></thead>
+<tbody>${loansHtml}</tbody></table>`:""}
 <script>window.print();<\/script>
 </body></html>`;
     const w = window.open("","_blank");
@@ -1622,16 +1636,17 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
             Every sale currently on record — cash vs card, per staff member, and what's been sold vs what's
             still on hand — pulled straight from live data. Nothing to upload.
           </p>
-          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
+          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:16,marginBottom:24}}>
             {[
               {l:"INVOICES",v:String(summary.invoiceCount)},
               {l:"UNITS SOLD",v:String(summary.totals.sold)},
+              {l:"ON LOAN",v:String(summary.totals.onLoan),loan:summary.totals.onLoan>0},
               {l:"UNITS ON HAND",v:String(summary.totals.remaining)},
               {l:"TOTAL REVENUE",v:fmt(summary.revenue)},
             ].map(c=>(
-              <div key={c.l} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:8,padding:"18px 20px"}}>
+              <div key={c.l} style={{background:"#141414",border:`1px solid ${c.loan?"#e67e22":"#2a2a2a"}`,borderRadius:8,padding:"18px 20px"}}>
                 <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:6}}>{c.l}</div>
-                <div className="mono" style={{fontSize:24,fontWeight:700,color:"#c9a84c"}}>{c.v}</div>
+                <div className="mono" style={{fontSize:24,fontWeight:700,color:c.loan?"#e67e22":"#c9a84c"}}>{c.v}</div>
               </div>
             ))}
           </div>
@@ -1682,10 +1697,10 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
             </table>
           </div>
 
-          <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. On Hand</p>
-          <div style={{overflowX:"auto"}}>
+          <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. On Loan vs. On Hand</p>
+          <div style={{overflowX:"auto",marginBottom:28}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Category","Size","Sold","Remaining"].map((h,i)=>(
+              <thead><tr>{["Category","Size","Sold","On Loan","Remaining"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>1?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -1696,12 +1711,28 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#888"}}>{r.size}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.sold}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
+                      color:r.onLoan>0?"#e67e22":"#444",fontWeight:r.onLoan>0?700:400}}>{r.onLoan||"—"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
                       color:r.remaining===0?"#e67e22":"#27ae60",fontWeight:700}}>{r.remaining}</td>
                   </tr>
                 ))}
               </tbody>
             </table>
           </div>
+
+          <p className="sec-label" style={{marginBottom:10}}>Currently On Loan — Reference</p>
+          {summary.openLoans.length===0
+            ? <p style={{color:"#444",fontSize:14}}>Nothing out on loan right now.</p>
+            : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {summary.openLoans.map(l=>(
+                  <div key={l.id} style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                    <span style={{color:"#d0d0c8"}}><strong>{l.qty} × {l.category}</strong> / {l.size} — to <strong>{l.borrower}</strong></span>
+                    {l.note && <span style={{color:"#888"}}> · {l.note}</span>}
+                    <div style={{color:"#555",fontSize:11,marginTop:2}}>Booked out {l.createdAt} by {l.cashier}</div>
+                  </div>
+                ))}
+              </div>
+          }
         </>
       )}
 
@@ -1824,6 +1855,24 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
               </tbody>
             </table>
           </div>
+
+          <p className="sec-label" style={{marginBottom:10,marginTop:28}}>Currently On Loan — Reference</p>
+          <p style={{fontSize:12,color:"#666",marginBottom:12,maxWidth:600}}>
+            If a variance above looks like a shortage, check here first — some of it may simply be out on loan,
+            not missing.
+          </p>
+          {openLoansList.length===0
+            ? <p style={{color:"#444",fontSize:14}}>Nothing out on loan right now.</p>
+            : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {openLoansList.map(l=>(
+                  <div key={l.id} style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                    <span style={{color:"#d0d0c8"}}><strong>{l.qty} × {l.category}</strong> / {l.size} — to <strong>{l.borrower}</strong></span>
+                    {l.note && <span style={{color:"#888"}}> · {l.note}</span>}
+                    <div style={{color:"#555",fontSize:11,marginTop:2}}>Booked out {l.createdAt} by {l.cashier}</div>
+                  </div>
+                ))}
+              </div>
+          }
         </>
       )}
       </>
@@ -2033,7 +2082,7 @@ export default function App() {
       {screen==="stock" && user.role==="admin" &&
         <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll}/>}
       {screen==="reconcile" && user.role==="admin" &&
-        <Reconcile stock={stock} sales={sales} toast={toast}/>}
+        <Reconcile stock={stock} sales={sales} loans={loans} toast={toast}/>}
       {screen==="sales" && !invoice &&
         <SalesScreen sales={sales} onView={onViewInvoice}/>}
       {screen==="sales" && invoice &&
