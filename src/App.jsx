@@ -1318,7 +1318,43 @@ function buildReconciliation(openingData, closingStock, closingSales) {
   return { rows, totals, revenue, cashierMap, paymentMap, newSalesCount: newSales.length };
 }
 
+// Straight "where do things stand right now" report — every sale currently on
+// record, cash/card and per-staff breakdowns, and current stock on hand.
+// Needs no opening backup, since it's not computing a before/after variance.
+function buildSummary(stock, sales) {
+  const soldMap = {};
+  const cashierMap = {};
+  const paymentMap = { cash:{units:0,revenue:0,invoices:0}, card:{units:0,revenue:0,invoices:0} };
+  sales.forEach(sale => {
+    cashierMap[sale.cashier] = cashierMap[sale.cashier] || { units:0, revenue:0, invoices:0 };
+    cashierMap[sale.cashier].revenue += sale.total;
+    cashierMap[sale.cashier].invoices += 1;
+    const pm = sale.paymentMethod==="card" ? "card" : "cash";
+    paymentMap[pm].revenue += sale.total;
+    paymentMap[pm].invoices += 1;
+    sale.items.forEach(item => {
+      const k = stockKey(item);
+      soldMap[k] = (soldMap[k]||0) + item.qty;
+      cashierMap[sale.cashier].units += item.qty;
+      paymentMap[pm].units += item.qty;
+    });
+  });
+
+  const rows = [];
+  stock.forEach(p => p.variants.forEach(v => {
+    const k = stockKey({category:p.category, sku:p.sku, size:v.size});
+    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, remaining: v.qty });
+  }));
+  rows.sort((a,b)=> a.category.localeCompare(b.category) || a.size.localeCompare(b.size));
+
+  const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining }), {sold:0,remaining:0});
+  const revenue = sales.reduce((s,sale)=>s+sale.total,0);
+
+  return { rows, totals, revenue, cashierMap, paymentMap, invoiceCount: sales.length };
+}
+
 function Reconcile({ stock, sales, toast }) {
+  const [mode, setMode] = useState("summary"); // "summary" (no file needed) | "variance" (opening vs closing)
   const [opening, setOpening] = useState(null);
   const [openingName, setOpeningName] = useState("");
   const [closingSource, setClosingSource] = useState("live"); // "live" | "file"
@@ -1337,6 +1373,46 @@ function Reconcile({ stock, sales, toast }) {
   const closingSales = closingSource==="live" ? sales : closing?.sales;
   const ready = opening && closingStock && closingSales;
   const result = ready ? buildReconciliation(opening, closingStock, closingSales) : null;
+  const summary = mode==="summary" ? buildSummary(stock, sales) : null;
+
+  const printSummary = () => {
+    if (!summary) return;
+    const rowsHtml = summary.rows.map(r=>
+      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.remaining}</td></tr>`).join("");
+    const cashierHtml = Object.entries(summary.cashierMap).map(([name,c])=>
+      `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+    const paymentHtml = Object.entries(summary.paymentMap).map(([method,c])=>
+      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+    const html = `<!DOCTYPE html><html><head><title>Sales Summary</title><style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;}
+table{width:100%;border-collapse:collapse;margin:16px 0 28px;}
+th{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;padding:6px 8px;border-bottom:2px solid #111;text-align:left;}
+td{padding:7px 8px;border-bottom:1px solid #ddd;font-size:13px;}
+.right{text-align:right;}
+h1{font-size:22px;margin-bottom:4px;}
+h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
+</style></head><body>
+<h1>IMPI RMS (Pty) Ltd — Sales Summary</h1>
+<h2>As at ${new Date().toLocaleString("en-ZA")}</h2>
+<p style="margin-bottom:4px;"><strong>Invoices:</strong> ${summary.invoiceCount}</p>
+<p style="margin-bottom:4px;"><strong>Total units sold:</strong> ${summary.totals.sold}</p>
+<p style="margin-bottom:4px;"><strong>Total units remaining on hand:</strong> ${summary.totals.remaining}</p>
+<p style="margin-bottom:20px;"><strong>Total revenue:</strong> ${fmt(summary.revenue)}</p>
+<h2 style="font-weight:700;color:#111;">By payment method</h2>
+<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
+<tbody>${paymentHtml}</tbody></table>
+<h2 style="font-weight:700;color:#111;">By staff member</h2>
+<table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
+<tbody>${cashierHtml}</tbody></table>
+<h2 style="font-weight:700;color:#111;">Stock sold vs. on hand</h2>
+<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">Remaining</th></tr></thead>
+<tbody>${rowsHtml}</tbody></table>
+<script>window.print();<\/script>
+</body></html>`;
+    const w = window.open("","_blank");
+    w.document.write(html); w.document.close();
+  };
 
   const printReport = () => {
     if (!result) return;
@@ -1382,6 +1458,102 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 
   return (
     <div style={{padding:24,maxWidth:1000,margin:"0 auto"}}>
+      <div style={{display:"flex",gap:8,marginBottom:20}}>
+        <button className={`pill-btn ${mode==="summary"?"active":""}`} onClick={()=>setMode("summary")}>📊 Sales Summary (no file needed)</button>
+        <button className={`pill-btn ${mode==="variance"?"active":""}`} onClick={()=>setMode("variance")}>🔍 Variance Check (opening vs closing)</button>
+      </div>
+
+      {mode==="summary" && (
+        <>
+          <p style={{fontSize:13,color:"#888",marginBottom:20,maxWidth:640}}>
+            Every sale currently on record — cash vs card, per staff member, and what's been sold vs what's
+            still on hand — pulled straight from live data. Nothing to upload.
+          </p>
+          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
+            {[
+              {l:"INVOICES",v:String(summary.invoiceCount)},
+              {l:"UNITS SOLD",v:String(summary.totals.sold)},
+              {l:"UNITS ON HAND",v:String(summary.totals.remaining)},
+              {l:"TOTAL REVENUE",v:fmt(summary.revenue)},
+            ].map(c=>(
+              <div key={c.l} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:8,padding:"18px 20px"}}>
+                <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:6}}>{c.l}</div>
+                <div className="mono" style={{fontSize:24,fontWeight:700,color:"#c9a84c"}}>{c.v}</div>
+              </div>
+            ))}
+          </div>
+
+          <button onClick={printSummary}
+            style={{background:"#222",color:"#d0d0c8",border:"1px solid #333",borderRadius:4,
+              padding:"10px 18px",fontSize:14,fontWeight:700,marginBottom:24}}>
+            🖨 Print / Save Report
+          </button>
+
+          <p className="sec-label" style={{marginBottom:10}}>By Payment Method</p>
+          <div style={{overflowX:"auto",marginBottom:28}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{["Method","Invoices","Units","Revenue"].map((h,i)=>(
+                <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
+                  color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>0?"right":"left"}}>{h}</th>
+              ))}</tr></thead>
+              <tbody>
+                {Object.entries(summary.paymentMap).map(([method,c])=>(
+                  <tr key={method}>
+                    <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#d0d0c8"}}>{method==="card"?"💳 Card":"💵 Cash"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.invoices}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.units}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#c9a84c",fontWeight:700}}>{fmt(c.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p className="sec-label" style={{marginBottom:10}}>By Staff Member</p>
+          <div style={{overflowX:"auto",marginBottom:28}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{["Cashier","Invoices","Units","Revenue"].map((h,i)=>(
+                <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
+                  color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>0?"right":"left"}}>{h}</th>
+              ))}</tr></thead>
+              <tbody>
+                {Object.entries(summary.cashierMap).map(([name,c])=>(
+                  <tr key={name}>
+                    <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#d0d0c8"}}>{name}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.invoices}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.units}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#c9a84c",fontWeight:700}}>{fmt(c.revenue)}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. On Hand</p>
+          <div style={{overflowX:"auto"}}>
+            <table style={{width:"100%",borderCollapse:"collapse"}}>
+              <thead><tr>{["Category","Size","Sold","Remaining"].map((h,i)=>(
+                <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
+                  color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>1?"right":"left"}}>{h}</th>
+              ))}</tr></thead>
+              <tbody>
+                {summary.rows.map((r,i)=>(
+                  <tr key={i}>
+                    <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#d0d0c8"}}>{r.category}</td>
+                    <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#888"}}>{r.size}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.sold}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
+                      color:r.remaining===0?"#e67e22":"#27ae60",fontWeight:700}}>{r.remaining}</td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </>
+      )}
+
+      {mode==="variance" && (
+      <>
       <p style={{fontSize:13,color:"#888",marginBottom:20,maxWidth:640}}>
         Load the backup taken at the <strong>start</strong> of the event (opening stock-take) and compare
         it against the <strong>end</strong> of the event — either the live data on this laptop right now,
@@ -1500,6 +1672,8 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
             </table>
           </div>
         </>
+      )}
+      </>
       )}
     </div>
   );
