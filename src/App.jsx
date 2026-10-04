@@ -6,6 +6,7 @@ import {
   fetchAllData, subscribeRealtime, addProduct as addProductAPI,
   applyAdjustmentRPC, setStockTakeRPC, completeSaleRPC, wipeAllDataRPC,
   createLoanRPC, returnLoanRPC, invoiceLoanRPC, fetchEvents, createEvent,
+  archiveEvent, unarchiveEvent, deleteEventPermanentlyRPC,
   isStockError, loadQueue, pushToQueue, removeFromQueue,
 } from "./sync.js";
 
@@ -372,10 +373,14 @@ function EventSelector({ user, onSelect, toast }) {
   const [newName, setNewName] = useState("");
   const [creating, setCreating] = useState(false);
   const [error, setError] = useState("");
+  const [showArchived, setShowArchived] = useState(false);
+  const [busyId, setBusyId] = useState(null);
 
-  useEffect(() => {
-    fetchEvents().then(setEvents).catch(err => { setError(err.message||"Couldn't load events"); setEvents([]); });
-  }, []);
+  const load = (includeArchived) => {
+    fetchEvents(includeArchived).then(setEvents).catch(err => { setError(err.message||"Couldn't load events"); setEvents([]); });
+  };
+
+  useEffect(() => { load(showArchived); /* eslint-disable-next-line react-hooks/exhaustive-deps */ }, [showArchived]);
 
   const create = async () => {
     if (!newName.trim()) { toast("✗ Give the event a name","error"); return; }
@@ -389,11 +394,57 @@ function EventSelector({ user, onSelect, toast }) {
     }
   };
 
+  const doArchive = async (ev) => {
+    if (!window.confirm(`Archive "${ev.name}"? It'll disappear from this list, but all its data stays safe — you can unarchive it any time.`)) return;
+    setBusyId(ev.id);
+    try {
+      await archiveEvent(ev.id);
+      toast(`✓ "${ev.name}" archived`,"success");
+      load(showArchived);
+    } catch (err) {
+      toast(`✗ Couldn't archive — ${err.message||"unknown error"}`,"error");
+    }
+    setBusyId(null);
+  };
+
+  const doUnarchive = async (ev) => {
+    setBusyId(ev.id);
+    try {
+      await unarchiveEvent(ev.id);
+      toast(`✓ "${ev.name}" restored`,"success");
+      load(showArchived);
+    } catch (err) {
+      toast(`✗ Couldn't restore — ${err.message||"unknown error"}`,"error");
+    }
+    setBusyId(null);
+  };
+
+  const doDelete = async (ev) => {
+    const typed = window.prompt(
+      `This PERMANENTLY deletes "${ev.name}" and every product, sale, adjustment and loan in it. ` +
+      `This cannot be undone — not even by Claude. A full backup downloads automatically first.\n\n` +
+      `Type the event name exactly to confirm:`
+    );
+    if (typed === null) return;
+    if (typed !== ev.name) { toast("✗ Name didn't match — nothing deleted","error"); return; }
+    setBusyId(ev.id);
+    try {
+      const data = await fetchAllData(ev.id);
+      downloadBackup(data.stock, data.sales, data.adjLog, data.loans, ev);
+      await deleteEventPermanentlyRPC(ev.id);
+      toast(`✓ "${ev.name}" permanently deleted — backup downloaded first`,"success");
+      load(showArchived);
+    } catch (err) {
+      toast(`✗ Couldn't delete — ${err.message||"unknown error"}`,"error");
+    }
+    setBusyId(null);
+  };
+
   return (
     <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",
       background:"#0a0a0a",padding:"24px 16px"}}>
       <div style={{background:"#141414",border:"2px solid #c9a84c",borderRadius:8,padding:"36px 32px",
-        maxWidth:480,width:"100%"}}>
+        maxWidth:520,width:"100%"}}>
         <div style={{textAlign:"center",marginBottom:24}}>
           <Logo h={80} center />
           <h2 style={{fontWeight:800,fontSize:17,color:"#f5f5f0",textTransform:"uppercase",letterSpacing:1,marginTop:12}}>
@@ -408,21 +459,50 @@ function EventSelector({ user, onSelect, toast }) {
         {error && <p style={{color:"#c0392b",fontSize:13,marginBottom:12}}>{error}</p>}
 
         {events && events.length>0 && (
-          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20,maxHeight:260,overflowY:"auto"}}>
+          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:16,maxHeight:300,overflowY:"auto"}}>
             {events.map(ev=>(
-              <button key={ev.id} onClick={()=>onSelect(ev)}
-                style={{textAlign:"left",background:"#1a1a1a",border:"1px solid #333",borderRadius:6,
-                  padding:"12px 14px",color:"#f5f5f0",cursor:"pointer"}}>
-                <div style={{fontWeight:700,fontSize:15}}>{ev.name}</div>
-                <div style={{fontSize:11,color:"#666",marginTop:2}}>
-                  Created by {ev.createdBy} · {new Date(ev.createdAt).toLocaleDateString("en-ZA")}
-                </div>
-              </button>
+              <div key={ev.id} style={{background:"#1a1a1a",border:`1px solid ${ev.active?"#333":"#555"}`,borderRadius:6,
+                padding:"12px 14px",opacity:ev.active?1:0.6}}>
+                <button onClick={()=>onSelect(ev)} disabled={busyId===ev.id}
+                  style={{display:"block",width:"100%",textAlign:"left",background:"none",border:"none",color:"#f5f5f0",cursor:"pointer",padding:0}}>
+                  <div style={{fontWeight:700,fontSize:15}}>{ev.name}{!ev.active && <span style={{color:"#888",fontWeight:400}}> (archived)</span>}</div>
+                  <div style={{fontSize:11,color:"#666",marginTop:2}}>
+                    Created by {ev.createdBy} · {new Date(ev.createdAt).toLocaleDateString("en-ZA")}
+                  </div>
+                </button>
+                {user.role==="admin" && (
+                  <div style={{display:"flex",gap:6,marginTop:8}}>
+                    {ev.active
+                      ? <button onClick={()=>doArchive(ev)} disabled={busyId===ev.id}
+                          style={{background:"none",border:"1px solid #666",borderRadius:4,color:"#888",fontSize:11,fontWeight:700,padding:"4px 10px"}}>
+                          📦 Archive
+                        </button>
+                      : <button onClick={()=>doUnarchive(ev)} disabled={busyId===ev.id}
+                          style={{background:"none",border:"1px solid #27ae60",borderRadius:4,color:"#27ae60",fontSize:11,fontWeight:700,padding:"4px 10px"}}>
+                          ↩ Unarchive
+                        </button>
+                    }
+                    <button onClick={()=>doDelete(ev)} disabled={busyId===ev.id}
+                      style={{background:"none",border:"1px solid #c0392b",borderRadius:4,color:"#c0392b",fontSize:11,fontWeight:700,padding:"4px 10px"}}>
+                      🗑 Delete Permanently
+                    </button>
+                  </div>
+                )}
+              </div>
             ))}
           </div>
         )}
         {events && events.length===0 && !error && (
-          <p style={{color:"#444",fontSize:14,textAlign:"center",marginBottom:20}}>No events yet — create the first one below.</p>
+          <p style={{color:"#444",fontSize:14,textAlign:"center",marginBottom:16}}>
+            {showArchived ? "No archived events." : "No events yet — create the first one below."}
+          </p>
+        )}
+
+        {user.role==="admin" && (
+          <label style={{display:"flex",alignItems:"center",gap:6,fontSize:12,color:"#888",marginBottom:20,cursor:"pointer"}}>
+            <input type="checkbox" checked={showArchived} onChange={e=>setShowArchived(e.target.checked)} />
+            Show archived events
+          </label>
         )}
 
         <div style={{borderTop:"1px solid #333",paddingTop:20}}>

@@ -13,11 +13,12 @@ import { supabase } from "./supabase.js";
 const QUEUE_KEY = "impi_pos_offline_queue_v1";
 
 // ── Events ───────────────────────────────────────────────────────────────────
-export async function fetchEvents() {
-  const { data, error } = await supabase.from("events")
-    .select("*").eq("active", true).order("created_at", { ascending: false });
+export async function fetchEvents(includeArchived) {
+  let q = supabase.from("events").select("*").order("created_at", { ascending: false });
+  if (!includeArchived) q = q.eq("active", true);
+  const { data, error } = await q;
   if (error) throw error;
-  return (data||[]).map(e => ({ id:e.id, name:e.name, createdBy:e.created_by, createdAt:e.created_at }));
+  return (data||[]).map(e => ({ id:e.id, name:e.name, createdBy:e.created_by, createdAt:e.created_at, active:e.active }));
 }
 
 export async function createEvent(name, cashier) {
@@ -25,6 +26,21 @@ export async function createEvent(name, cashier) {
     .insert({ name, created_by: cashier }).select().single();
   if (error) throw error;
   return { id:data.id, name:data.name, createdBy:data.created_by, createdAt:data.created_at };
+}
+
+export async function archiveEvent(eventId) {
+  const { error } = await supabase.from("events").update({ active: false }).eq("id", eventId);
+  if (error) throw error;
+}
+
+export async function unarchiveEvent(eventId) {
+  const { error } = await supabase.from("events").update({ active: true }).eq("id", eventId);
+  if (error) throw error;
+}
+
+export async function deleteEventPermanentlyRPC(eventId) {
+  const { error } = await supabase.rpc("delete_event_permanently", { p_event_id: eventId });
+  if (error) throw error;
 }
 
 // ── Fetch & nest — everything scoped to one event ───────────────────────────
