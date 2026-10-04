@@ -3,22 +3,41 @@
 // All reads/writes to the shared Supabase backend go through here, plus the
 // offline queue that lets a sale complete locally even with no network, and
 // replay itself once the connection comes back.
+//
+// Every table (except events itself) carries an event_id, and every read/
+// write below is scoped to one event — this is what lets multiple events run
+// on the same shared backend without their stock or sales ever mixing.
 // ─────────────────────────────────────────────────────────────────────────────
 import { supabase } from "./supabase.js";
 
 const QUEUE_KEY = "impi_pos_offline_queue_v1";
 
-// ── Fetch & nest ────────────────────────────────────────────────────────────
-export async function fetchAllData() {
+// ── Events ───────────────────────────────────────────────────────────────────
+export async function fetchEvents() {
+  const { data, error } = await supabase.from("events")
+    .select("*").eq("active", true).order("created_at", { ascending: false });
+  if (error) throw error;
+  return (data||[]).map(e => ({ id:e.id, name:e.name, createdBy:e.created_by, createdAt:e.created_at }));
+}
+
+export async function createEvent(name, cashier) {
+  const { data, error } = await supabase.from("events")
+    .insert({ name, created_by: cashier }).select().single();
+  if (error) throw error;
+  return { id:data.id, name:data.name, createdBy:data.created_by, createdAt:data.created_at };
+}
+
+// ── Fetch & nest — everything scoped to one event ───────────────────────────
+export async function fetchAllData(eventId) {
   const [{ data: products, error: pErr }, { data: variants, error: vErr },
          { data: sales, error: sErr }, { data: saleItems, error: siErr },
          { data: adjustments, error: aErr }, { data: loans, error: lErr }] = await Promise.all([
-    supabase.from("products").select("*").order("created_at", { ascending: true }),
-    supabase.from("variants").select("*"),
-    supabase.from("sales").select("*").order("created_at", { ascending: true }),
-    supabase.from("sale_items").select("*"),
-    supabase.from("adjustments").select("*").order("created_at", { ascending: false }),
-    supabase.from("loans").select("*").order("created_at", { ascending: false }),
+    supabase.from("products").select("*").eq("event_id", eventId).order("created_at", { ascending: true }),
+    supabase.from("variants").select("*").eq("event_id", eventId),
+    supabase.from("sales").select("*").eq("event_id", eventId).order("created_at", { ascending: true }),
+    supabase.from("sale_items").select("*").eq("event_id", eventId),
+    supabase.from("adjustments").select("*").eq("event_id", eventId).order("created_at", { ascending: false }),
+    supabase.from("loans").select("*").eq("event_id", eventId).order("created_at", { ascending: false }),
   ]);
   if (pErr||vErr||sErr||siErr||aErr||lErr) throw (pErr||vErr||sErr||siErr||aErr||lErr);
 
@@ -54,26 +73,27 @@ export async function fetchAllData() {
   return { stock, sales: salesOut, adjLog, loans: loansOut };
 }
 
-// ── Realtime — refetch-on-change (simple, robust, fine at this scale) ──────
-export function subscribeRealtime(onChange) {
-  const channel = supabase.channel("impi-pos-live")
-    .on("postgres_changes", { event:"*", schema:"public", table:"products" }, onChange)
-    .on("postgres_changes", { event:"*", schema:"public", table:"variants" }, onChange)
-    .on("postgres_changes", { event:"*", schema:"public", table:"sales" }, onChange)
-    .on("postgres_changes", { event:"*", schema:"public", table:"sale_items" }, onChange)
-    .on("postgres_changes", { event:"*", schema:"public", table:"adjustments" }, onChange)
-    .on("postgres_changes", { event:"*", schema:"public", table:"loans" }, onChange)
+// ── Realtime — refetch-on-change, filtered to one event (simple, robust) ───
+export function subscribeRealtime(eventId, onChange) {
+  const filter = `event_id=eq.${eventId}`;
+  const channel = supabase.channel(`impi-pos-live-${eventId}`)
+    .on("postgres_changes", { event:"*", schema:"public", table:"products", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"variants", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"sales", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"sale_items", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"adjustments", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"loans", filter }, onChange)
     .subscribe();
   return () => supabase.removeChannel(channel);
 }
 
 // ── Writes ───────────────────────────────────────────────────────────────────
-export async function addProduct(category, sku, variantRows) {
+export async function addProduct(category, sku, variantRows, eventId) {
   const { data: prod, error: pErr } = await supabase.from("products")
-    .insert({ category, sku }).select().single();
+    .insert({ category, sku, event_id: eventId }).select().single();
   if (pErr) throw pErr;
   const { data: vs, error: vErr } = await supabase.from("variants")
-    .insert(variantRows.map(v=>({ product_id:prod.id, size:v.size, price:v.price, qty:v.qty })))
+    .insert(variantRows.map(v=>({ product_id:prod.id, event_id:eventId, size:v.size, price:v.price, qty:v.qty })))
     .select();
   if (vErr) throw vErr;
   return { id:prod.id, category:prod.category, sku:prod.sku,
@@ -96,9 +116,9 @@ export async function setStockTakeRPC(variantId, newQty, cashier) {
   return data;
 }
 
-export async function completeSaleRPC(cashier, client, items, subtotal, vat, total, testMode, paymentMethod) {
+export async function completeSaleRPC(eventId, cashier, client, items, subtotal, vat, total, testMode, paymentMethod) {
   const { data, error } = await supabase.rpc("complete_sale", {
-    p_cashier: cashier, p_client: client,
+    p_event_id: eventId, p_cashier: cashier, p_client: client,
     p_items: items.map(i=>({ variant_id:i.variantId, product_id:i.productId, category:i.category, sku:i.sku, size:i.size, qty:i.qty, price:i.price })),
     p_subtotal: subtotal, p_vat: vat, p_total: total, p_test_mode: !!testMode, p_payment_method: paymentMethod||"cash",
   });
@@ -106,8 +126,8 @@ export async function completeSaleRPC(cashier, client, items, subtotal, vat, tot
   return data; // new invoice id
 }
 
-export async function wipeAllDataRPC() {
-  const { error } = await supabase.rpc("wipe_all_data");
+export async function wipeAllDataRPC(eventId) {
+  const { error } = await supabase.rpc("wipe_all_data", { p_event_id: eventId });
   if (error) throw error;
 }
 

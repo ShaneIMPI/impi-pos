@@ -5,7 +5,7 @@ import { SUPABASE_CONFIGURED } from "./supabase.js";
 import {
   fetchAllData, subscribeRealtime, addProduct as addProductAPI,
   applyAdjustmentRPC, setStockTakeRPC, completeSaleRPC, wipeAllDataRPC,
-  createLoanRPC, returnLoanRPC, invoiceLoanRPC,
+  createLoanRPC, returnLoanRPC, invoiceLoanRPC, fetchEvents, createEvent,
   isStockError, loadQueue, pushToQueue, removeFromQueue,
 } from "./sync.js";
 
@@ -13,19 +13,30 @@ import {
 const VAT_RATE = 0; // IMPI does not charge VAT on PPE sales
 const BASE = import.meta.env.BASE_URL; // correct logo path whether run locally or under a GitHub Pages subfolder
 
-// ─── Local cache (fallback only) ───────────────────────────────────────────────
+// ─── Last-used event (which event this device was last working on) ────────────
+// Tiny and safe to read before any event is chosen — just an id + name, not
+// any actual stock/sales data.
+const LAST_EVENT_KEY = "impi_pos_last_event_v1";
+const loadLastEvent = () => {
+  try { return JSON.parse(localStorage.getItem(LAST_EVENT_KEY)); } catch { return null; }
+};
+const saveLastEvent = ev => {
+  try { localStorage.setItem(LAST_EVENT_KEY, JSON.stringify(ev)); } catch {}
+};
+
+// ─── Local cache (fallback only, scoped per event) ─────────────────────────────
 // The shared Supabase backend is the source of truth for every device. This
 // local cache exists purely so the app still shows last-known data if it's
 // opened while offline — it is overwritten by the server every time a fetch
-// succeeds, and is never treated as authoritative when online.
-const LS_KEY = "impi_pos_cache_v2";
-const loadCache = () => {
-  try { return JSON.parse(localStorage.getItem(LS_KEY)) || {}; }
+// succeeds, and is never treated as authoritative when online. Keyed by event
+// id so one event's cached data can never bleed into another's.
+const cacheKey = eventId => `impi_pos_cache_v2_${eventId}`;
+const loadCache = eventId => {
+  try { return JSON.parse(localStorage.getItem(cacheKey(eventId))) || {}; }
   catch { return {}; }
 };
-const CACHE = loadCache();
-const saveCache = (stock, sales, adjLog, loans) => {
-  try { localStorage.setItem(LS_KEY, JSON.stringify({ stock, sales, adjLog, loans, savedAt: new Date().toISOString() })); }
+const saveCache = (eventId, stock, sales, adjLog, loans) => {
+  try { localStorage.setItem(cacheKey(eventId), JSON.stringify({ stock, sales, adjLog, loans, savedAt: new Date().toISOString() })); }
   catch (e) { console.error("Cache save failed", e); }
 };
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(()=>fn(...a), ms); }; };
@@ -351,19 +362,100 @@ function LoginScreen({ onLogin }) {
   );
 }
 
+// ─── Event Selector ─────────────────────────────────────────────────────────
+// Every event is a logically separate workspace on the same shared backend —
+// its own stock, sales, adjustments and loans, walled off from every other
+// event. This is what runs before anything else loads, so the right one gets
+// picked before any data is fetched.
+function EventSelector({ user, onSelect, toast }) {
+  const [events, setEvents] = useState(null); // null = loading
+  const [newName, setNewName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [error, setError] = useState("");
+
+  useEffect(() => {
+    fetchEvents().then(setEvents).catch(err => { setError(err.message||"Couldn't load events"); setEvents([]); });
+  }, []);
+
+  const create = async () => {
+    if (!newName.trim()) { toast("✗ Give the event a name","error"); return; }
+    setCreating(true);
+    try {
+      const ev = await createEvent(newName.trim(), user.username);
+      onSelect(ev);
+    } catch (err) {
+      toast(`✗ Couldn't create event — ${err.message||"unknown error"}`,"error");
+      setCreating(false);
+    }
+  };
+
+  return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",
+      background:"#0a0a0a",padding:"24px 16px"}}>
+      <div style={{background:"#141414",border:"2px solid #c9a84c",borderRadius:8,padding:"36px 32px",
+        maxWidth:480,width:"100%"}}>
+        <div style={{textAlign:"center",marginBottom:24}}>
+          <Logo h={80} center />
+          <h2 style={{fontWeight:800,fontSize:17,color:"#f5f5f0",textTransform:"uppercase",letterSpacing:1,marginTop:12}}>
+            Select Event
+          </h2>
+          <p style={{fontSize:12,color:"#666",marginTop:6}}>
+            Each event has its own stock and sales — pick yours, or start a new one.
+          </p>
+        </div>
+
+        {events===null && <p style={{color:"#666",textAlign:"center",padding:20}}>Loading events…</p>}
+        {error && <p style={{color:"#c0392b",fontSize:13,marginBottom:12}}>{error}</p>}
+
+        {events && events.length>0 && (
+          <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:20,maxHeight:260,overflowY:"auto"}}>
+            {events.map(ev=>(
+              <button key={ev.id} onClick={()=>onSelect(ev)}
+                style={{textAlign:"left",background:"#1a1a1a",border:"1px solid #333",borderRadius:6,
+                  padding:"12px 14px",color:"#f5f5f0",cursor:"pointer"}}>
+                <div style={{fontWeight:700,fontSize:15}}>{ev.name}</div>
+                <div style={{fontSize:11,color:"#666",marginTop:2}}>
+                  Created by {ev.createdBy} · {new Date(ev.createdAt).toLocaleDateString("en-ZA")}
+                </div>
+              </button>
+            ))}
+          </div>
+        )}
+        {events && events.length===0 && !error && (
+          <p style={{color:"#444",fontSize:14,textAlign:"center",marginBottom:20}}>No events yet — create the first one below.</p>
+        )}
+
+        <div style={{borderTop:"1px solid #333",paddingTop:20}}>
+          <label className="sec-label">New Event Name</label>
+          <input className="field-input" placeholder="e.g. Seamless Africa 2026" value={newName}
+            onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&create()} style={{marginBottom:10}} />
+          <button onClick={create} disabled={creating}
+            style={{width:"100%",background:creating?"#555":"linear-gradient(135deg,#FFD700,#c9a84c)",
+              color:creating?"#999":"#000",fontWeight:900,fontSize:15,letterSpacing:2,textTransform:"uppercase",
+              padding:"12px 0",border:"none",borderRadius:4}}>
+            {creating?"Creating…":"+ Create & Use This Event"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 // ─── Header ───────────────────────────────────────────────────────────────────
-function downloadBackup(stock, sales, adjLog, loans) {
-  const blob = new Blob([JSON.stringify({ stock, sales, adjLog, loans, exportedAt: new Date().toISOString() }, null, 2)],
-    { type: "application/json" });
+function downloadBackup(stock, sales, adjLog, loans, event) {
+  const blob = new Blob([JSON.stringify({
+    stock, sales, adjLog, loans, eventId: event?.id, eventName: event?.name, exportedAt: new Date().toISOString(),
+  }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `impi-pos-backup-${new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")}.json`;
+  const safeName = (event?.name||"event").replace(/[^a-z0-9]+/gi,"-").toLowerCase();
+  a.download = `impi-pos-backup-${safeName}-${new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")}.json`;
   a.click();
   URL.revokeObjectURL(url);
 }
 
-function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans, onResetAll, online, queueCount, syncIssuesCount }) {
+function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans, onResetAll, online, queueCount, syncIssuesCount, event, onSwitchEvent }) {
   const navItems = [
     { key:"pos",   icon:"⚡", label:"POS" },
     { key:"stock", icon:"📦", label:"Stock", admin:true },
@@ -380,6 +472,17 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans
           <div style={{fontWeight:800,fontSize:15,color:"#f5f5f0",textTransform:"uppercase",letterSpacing:1}}>IMPI RMS (Pty) Ltd</div>
           <div style={{fontSize:11,color:"#666",letterSpacing:1}}>PPE Mobile Shop · POS</div>
         </div>
+        {user.role==="admin"
+          ? <button onClick={onSwitchEvent} title="Switch to a different event"
+              style={{background:"#1a1a1a",border:"1px solid #c9a84c",borderRadius:20,padding:"5px 12px",
+                color:"#c9a84c",fontSize:12,fontWeight:700,marginLeft:4,whiteSpace:"nowrap"}}>
+              📅 {event?.name||"No event"} ▾
+            </button>
+          : <span style={{background:"#1a1a1a",border:"1px solid #333",borderRadius:20,padding:"5px 12px",
+                color:"#888",fontSize:12,fontWeight:700,marginLeft:4,whiteSpace:"nowrap"}}>
+              📅 {event?.name||"No event"}
+            </span>
+        }
       </div>
       <div style={{display:"flex",alignItems:"center",gap:8,flexShrink:0}}>
         <span title={online?"Connected — every device sees this data live":"No connection — sales are being saved locally and will sync automatically"}
@@ -408,7 +511,7 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans
           {user.role==="admin"?"ADMIN":"STAFF"}
         </span>
         {user.role==="admin" && (
-          <button onClick={()=>downloadBackup(stock, sales, adjLog, loans)} title="Download a backup of all stock and sales data"
+          <button onClick={()=>downloadBackup(stock, sales, adjLog, loans, event)} title="Download a backup of all stock and sales data"
             style={{background:"#222",color:"#c9a84c",border:"1px solid #333",borderRadius:4,
               padding:"8px 12px",fontWeight:700,fontSize:13,letterSpacing:1}}>
             ⬇ BACKUP
@@ -923,7 +1026,7 @@ function ViewStock({ stock }) {
 }
 
 // ─── Add Product ──────────────────────────────────────────────────────────────
-function AddProduct({ toast, refreshAll }) {
+function AddProduct({ toast, refreshAll, eventId }) {
   const [cat, setCat] = useState("");
   const [sku, setSku] = useState("");
   const [variants, setVariants] = useState([{size:"",price:"",qty:""}]);
@@ -942,7 +1045,7 @@ function AddProduct({ toast, refreshAll }) {
     setSaving(true);
     try {
       await addProductAPI(cat.trim(), sku.trim().toUpperCase(),
-        valid.map(v=>({size:v.size,price:parseFloat(v.price)||0,qty:parseInt(v.qty)||0})));
+        valid.map(v=>({size:v.size,price:parseFloat(v.price)||0,qty:parseInt(v.qty)||0})), eventId);
       await refreshAll();
     } catch (err) {
       setSaving(false);
@@ -1334,7 +1437,7 @@ function LoanBorrow({ stock, user, toast, loans, refreshAll }) {
 }
 
 // ─── Stock Screen ─────────────────────────────────────────────────────────────
-function StockScreen({ stock, user, toast, adjLog, loans, refreshAll }) {
+function StockScreen({ stock, user, toast, adjLog, loans, refreshAll, eventId }) {
   const [tab, setTab] = useState("view");
   const tabs = [{key:"view",label:"📦 View Stock"},{key:"add",label:"➕ Add Product"},{key:"adjust",label:"🔧 Adjustments"},
     {key:"take",label:"📋 Stock Take"},{key:"loan",label:"🤝 Loan / Borrow"}];
@@ -1351,7 +1454,7 @@ function StockScreen({ stock, user, toast, adjLog, loans, refreshAll }) {
         ))}
       </div>
       {tab==="view"   &&<ViewStock stock={stock} />}
-      {tab==="add"    &&<AddProduct toast={toast} refreshAll={refreshAll} />}
+      {tab==="add"    &&<AddProduct toast={toast} refreshAll={refreshAll} eventId={eventId} />}
       {tab==="adjust" &&<Adjustments stock={stock} user={user} toast={toast} log={adjLog} refreshAll={refreshAll} />}
       {tab==="take"   &&<StockTake stock={stock} user={user} toast={toast} refreshAll={refreshAll} />}
       {tab==="loan"   &&<LoanBorrow stock={stock} user={user} toast={toast} loans={loans} refreshAll={refreshAll} />}
@@ -1513,7 +1616,7 @@ function buildSummary(stock, sales, loans) {
   return { rows, totals, revenue, cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
 }
 
-function Reconcile({ stock, sales, loans, toast }) {
+function Reconcile({ stock, sales, loans, toast, event }) {
   const [mode, setMode] = useState("summary"); // "summary" (no file needed) | "variance" (opening vs closing)
   const [opening, setOpening] = useState(null);
   const [openingName, setOpeningName] = useState("");
@@ -1525,7 +1628,14 @@ function Reconcile({ stock, sales, loans, toast }) {
     const file = e.target.files[0];
     if (!file) return;
     readBackupFile(file,
-      data => { setData(data); setName(file.name); toast(`✓ Loaded ${file.name}`,"success"); },
+      data => {
+        setData(data); setName(file.name);
+        if (data.eventId && event?.id && data.eventId !== event.id) {
+          toast(`⚠ Loaded ${file.name} — but it's from a DIFFERENT event (${data.eventName||"unknown"}), not "${event.name}". Numbers won't line up.`,"error");
+        } else {
+          toast(`✓ Loaded ${file.name}`,"success");
+        }
+      },
       () => toast("✗ Couldn't read that file — is it a valid IMPI POS backup .json?","error"));
   };
 
@@ -1885,11 +1995,12 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 export default function App() {
   const [showHero, setShowHero]   = useState(true);
   const [user, setUser]           = useState(null);
+  const [event, setEvent]         = useState(()=> loadLastEvent());
   const [screen, setScreen]       = useState("pos");
-  const [stock, setStock]         = useState(()=> CACHE.stock || []);
-  const [sales, setSales]         = useState(()=> CACHE.sales || []);
-  const [adjLog, setAdjLog]       = useState(()=> CACHE.adjLog || []);
-  const [loans, setLoans]         = useState(()=> CACHE.loans || []);
+  const [stock, setStock]         = useState([]);
+  const [sales, setSales]         = useState([]);
+  const [adjLog, setAdjLog]       = useState([]);
+  const [loans, setLoans]         = useState([]);
   const [invoice, setInvoice]     = useState(null);
   const [loading, setLoading]     = useState(SUPABASE_CONFIGURED);
   const [online, setOnline]       = useState(navigator.onLine);
@@ -1904,35 +2015,40 @@ export default function App() {
     return ()=>document.head.removeChild(s);
   },[]);
 
-  // Pull the full current dataset from the shared backend. This is the single
-  // source of truth for every device — local state always defers to this.
+  // Pull the full current dataset for the SELECTED EVENT from the shared
+  // backend. This is the single source of truth for every device working on
+  // this event — local state always defers to this.
   const refreshAll = useCallback(async () => {
-    if (!SUPABASE_CONFIGURED) return;
+    if (!SUPABASE_CONFIGURED || !event) return;
     try {
-      const data = await fetchAllData();
+      const data = await fetchAllData(event.id);
       setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog); setLoans(data.loans);
-      saveCache(data.stock, data.sales, data.adjLog, data.loans);
+      saveCache(event.id, data.stock, data.sales, data.adjLog, data.loans);
       setOnline(true);
     } catch (err) {
       console.error("Refresh failed", err);
       setOnline(false);
     }
-  }, []);
+  }, [event]);
 
   // Replays sales that were completed while offline, in order, the moment a
-  // connection is available. Genuine stock conflicts (someone else sold the
-  // last unit while this device was offline) are pulled out for manual review
-  // rather than silently dropped or silently forced through.
+  // connection is available. Each queued entry carries the event it was made
+  // under, so a sale started on one event always replays against that same
+  // event even if this device has since switched to another. Genuine stock
+  // conflicts (someone else sold the last unit while this device was
+  // offline) are pulled out for manual review rather than silently dropped.
   const flushQueue = useCallback(async () => {
     let q = loadQueue();
     if (!q.length) return;
     let anySynced = false;
     for (const entry of [...q]) {
       try {
-        const newId = await completeSaleRPC(entry.cashier, entry.client, entry.items, entry.subtotal, entry.vat, entry.total, entry.testMode, entry.paymentMethod);
+        const newId = await completeSaleRPC(entry.eventId, entry.cashier, entry.client, entry.items, entry.subtotal, entry.vat, entry.total, entry.testMode, entry.paymentMethod);
         q = removeFromQueue(entry.tempId);
         setQueueCount(q.length);
-        setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, id:newId, pending:false} : s));
+        if (entry.eventId === event?.id) {
+          setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, id:newId, pending:false} : s));
+        }
         toast(`✓ Synced ${entry.tempId} → ${newId}`, "success");
         anySynced = true;
       } catch (err) {
@@ -1940,7 +2056,9 @@ export default function App() {
           setSyncIssues(prev => [...prev, {...entry, error: err.message}]);
           q = removeFromQueue(entry.tempId);
           setQueueCount(q.length);
-          setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, pending:false, syncFailed:true} : s));
+          if (entry.eventId === event?.id) {
+            setSales(prev => prev.map(s => s.id===entry.tempId ? {...s, pending:false, syncFailed:true} : s));
+          }
           toast(`⚠ ${entry.tempId} couldn't sync — stock conflict, needs manual review`, "error");
         } else {
           break; // still offline — stop here, the rest will retry next pass
@@ -1948,13 +2066,18 @@ export default function App() {
       }
     }
     if (anySynced) refreshAll();
-  }, [refreshAll, toast]);
+  }, [refreshAll, toast, event]);
 
+  // Re-fetch and re-subscribe whenever the selected event changes, not just on mount.
   useEffect(() => {
-    if (!SUPABASE_CONFIGURED) { setLoading(false); return; }
+    if (!SUPABASE_CONFIGURED || !event) { setLoading(false); return; }
+    setLoading(true);
+    // Show last-known cached data for THIS event immediately, before the live fetch returns.
+    const cached = loadCache(event.id);
+    if (cached.stock) { setStock(cached.stock); setSales(cached.sales||[]); setAdjLog(cached.adjLog||[]); setLoans(cached.loans||[]); }
     let cancelled = false;
     (async () => { await refreshAll(); if (!cancelled) setLoading(false); })();
-    const unsub = subscribeRealtime(debounce(refreshAll, 400));
+    const unsub = subscribeRealtime(event.id, debounce(refreshAll, 400));
     const onOnline  = () => { setOnline(true); flushQueue(); };
     const onOffline = () => setOnline(false);
     window.addEventListener("online", onOnline);
@@ -1968,22 +2091,25 @@ export default function App() {
       clearInterval(interval);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [event?.id]);
 
   const login  = u => { setUser(u); setScreen("pos"); };
   const logout = () => { setUser(null); setInvoice(null); setScreen("pos"); };
+  const selectEvent = ev => { setEvent(ev); saveLastEvent(ev); setScreen("pos"); };
+  const switchEvent = () => setEvent(null);
 
   const resetAllData = async () => {
+    if (!event) return;
     if (!window.confirm(
-      "This downloads a safety backup first, then PERMANENTLY WIPES the shared stock, sales and " +
-      "adjustment history for EVERY device connected to this app — not just this one. Use this to " +
-      "start a genuinely new event. Continue?"
+      `This downloads a safety backup first, then PERMANENTLY WIPES the shared stock, sales and ` +
+      `adjustment history for "${event.name}" — not other events on this system. Every device ` +
+      `currently working on this event will see it cleared. Use this to start fresh. Continue?`
     )) return;
-    downloadBackup(stock, sales, adjLog, loans);
+    downloadBackup(stock, sales, adjLog, loans, event);
     try {
-      await wipeAllDataRPC();
+      await wipeAllDataRPC(event.id);
       await refreshAll();
-      toast("✓ All shared data cleared — backup downloaded, starting fresh", "success");
+      toast(`✓ "${event.name}" cleared — backup downloaded, starting fresh`, "success");
     } catch (err) {
       console.error("Reset failed:", err);
       toast(`✗ Couldn't reset — ${err?.message || "unknown error"}`, "error");
@@ -2003,7 +2129,7 @@ export default function App() {
     const itemsSnap = cart.map(({cartId,...rest})=>rest);
 
     try {
-      const newId = await completeSaleRPC(user.username, clientSnap, itemsSnap, sub, vatAmt, total, TEST_MODE, paymentMethod);
+      const newId = await completeSaleRPC(event.id, user.username, clientSnap, itemsSnap, sub, vatAmt, total, TEST_MODE, paymentMethod);
       await refreshAll();
       const inv = { id:newId, date:dateStr(), cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE };
       toast(`✓ Sale complete — Invoice ${inv.id}`, "success");
@@ -2020,7 +2146,7 @@ export default function App() {
         return ci ? {...v, qty:Math.max(0, v.qty-ci.qty)} : v;
       })})));
       setSales(prev=>[...prev, inv]);
-      pushToQueue({ tempId, cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE });
+      pushToQueue({ tempId, eventId:event.id, cashier:user.username, client:clientSnap, paymentMethod, items:itemsSnap, subtotal:sub, vat:vatAmt, total, testMode:TEST_MODE });
       setQueueCount(loadQueue().length);
       setOnline(false);
       toast(`⚠ No connection — saved locally as ${tempId}, will sync automatically once back online`, "error");
@@ -2055,12 +2181,6 @@ export default function App() {
     </div>
   );
 
-  if (loading) return (
-    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0a0a"}}>
-      <Logo h={90} glow center/>
-    </div>
-  );
-
   if (!user) return (
     <>
       <TestBanner/>
@@ -2069,20 +2189,35 @@ export default function App() {
     </>
   );
 
+  if (!event) return (
+    <>
+      <TestBanner/>
+      <EventSelector user={user} onSelect={selectEvent} toast={toast}/>
+      <Toasts toasts={toasts} dismiss={dismiss}/>
+    </>
+  );
+
+  if (loading) return (
+    <div style={{minHeight:"100vh",display:"flex",alignItems:"center",justifyContent:"center",background:"#0a0a0a"}}>
+      <Logo h={90} glow center/>
+    </div>
+  );
+
   return (
     <>
       <TestBanner/>
       <Header user={user} screen={activeNav} setScreen={navTo} onLogout={logout} stock={stock} sales={sales}
-        adjLog={adjLog} loans={loans} onResetAll={resetAllData} online={online} queueCount={queueCount} syncIssuesCount={syncIssues.length}/>
+        adjLog={adjLog} loans={loans} onResetAll={resetAllData} online={online} queueCount={queueCount}
+        syncIssuesCount={syncIssues.length} event={event} onSwitchEvent={switchEvent}/>
       <Toasts toasts={toasts} dismiss={dismiss}/>
       {screen==="pos" &&
         <POSScreen stock={stock} user={user} toast={toast} onCompleteSale={completeSaleFlow} onSaleComplete={onSaleComplete}/>}
       {screen==="invoice" && invoice &&
         <InvoiceView invoice={invoice} onBack={()=>{setInvoice(null);setScreen("pos");}}/>}
       {screen==="stock" && user.role==="admin" &&
-        <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll}/>}
+        <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll} eventId={event.id}/>}
       {screen==="reconcile" && user.role==="admin" &&
-        <Reconcile stock={stock} sales={sales} loans={loans} toast={toast}/>}
+        <Reconcile stock={stock} sales={sales} loans={loans} toast={toast} event={event}/>}
       {screen==="sales" && !invoice &&
         <SalesScreen sales={sales} onView={onViewInvoice}/>}
       {screen==="sales" && invoice &&
