@@ -895,18 +895,23 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
 // ─── Invoice View ─────────────────────────────────────────────────────────────
 function InvoiceView({ invoice, onBack }) {
   const emailInvoice = () => {
-    const subject = `Tax Invoice ${invoice.id} — IMPI RMS (Pty) Ltd`;
+    const subject = `Invoice ${invoice.id} – IMPI RMS (Pty) Ltd`;
+    const paidBy = invoice.paymentMethod === "card" ? "card" : "cash";
     const body =
 `Dear ${invoice.client.name || "Customer"},
 
-Please find attached your invoice ${invoice.id} dated ${invoice.date}, total ${fmt(invoice.total)} (incl. VAT).
+Thank you for your purchase. Please find your invoice ${invoice.id} attached.
 
-Please click "Print / Save PDF" first, save the PDF, then attach it to this email before sending.
+Total: ${fmt(invoice.total).replace("R ", "R")} (paid by ${paidBy})
+
+If you have any questions, simply reply to this email or call us on 012 543 0640.
 
 Kind regards,
-${invoice.cashier}
+
+Shane Steynfaardt
 IMPI RMS (Pty) Ltd
-info@impi-secure.co.za · 083 782 2207`;
+012 543 0640 | info@impi-secure.co.za
+www.impi-secure.co.za`;
     const to = invoice.client.email || "";
     window.location.href = `mailto:${to}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
   };
