@@ -5,6 +5,7 @@ import { SUPABASE_CONFIGURED } from "./supabase.js";
 import {
   fetchAllData, subscribeRealtime, addProduct as addProductAPI,
   applyAdjustmentRPC, setStockTakeRPC, completeSaleRPC, wipeAllDataRPC,
+  createLoanRPC, returnLoanRPC, invoiceLoanRPC,
   isStockError, loadQueue, pushToQueue, removeFromQueue,
 } from "./sync.js";
 
@@ -23,8 +24,8 @@ const loadCache = () => {
   catch { return {}; }
 };
 const CACHE = loadCache();
-const saveCache = (stock, sales, adjLog) => {
-  try { localStorage.setItem(LS_KEY, JSON.stringify({ stock, sales, adjLog, savedAt: new Date().toISOString() })); }
+const saveCache = (stock, sales, adjLog, loans) => {
+  try { localStorage.setItem(LS_KEY, JSON.stringify({ stock, sales, adjLog, loans, savedAt: new Date().toISOString() })); }
   catch (e) { console.error("Cache save failed", e); }
 };
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(()=>fn(...a), ms); }; };
@@ -351,8 +352,8 @@ function LoginScreen({ onLogin }) {
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
-function downloadBackup(stock, sales, adjLog) {
-  const blob = new Blob([JSON.stringify({ stock, sales, adjLog, exportedAt: new Date().toISOString() }, null, 2)],
+function downloadBackup(stock, sales, adjLog, loans) {
+  const blob = new Blob([JSON.stringify({ stock, sales, adjLog, loans, exportedAt: new Date().toISOString() }, null, 2)],
     { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -362,7 +363,7 @@ function downloadBackup(stock, sales, adjLog) {
   URL.revokeObjectURL(url);
 }
 
-function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onResetAll, online, queueCount, syncIssuesCount }) {
+function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans, onResetAll, online, queueCount, syncIssuesCount }) {
   const navItems = [
     { key:"pos",   icon:"⚡", label:"POS" },
     { key:"stock", icon:"📦", label:"Stock", admin:true },
@@ -407,7 +408,7 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, onRes
           {user.role==="admin"?"ADMIN":"STAFF"}
         </span>
         {user.role==="admin" && (
-          <button onClick={()=>downloadBackup(stock, sales, adjLog)} title="Download a backup of all stock and sales data"
+          <button onClick={()=>downloadBackup(stock, sales, adjLog, loans)} title="Download a backup of all stock and sales data"
             style={{background:"#222",color:"#c9a84c",border:"1px solid #333",borderRadius:4,
               padding:"8px 12px",fontWeight:700,fontSize:13,letterSpacing:1}}>
             ⬇ BACKUP
@@ -1182,10 +1183,161 @@ function StockTake({ stock, user, toast, refreshAll }) {
   );
 }
 
+// ─── Loan / Borrow ──────────────────────────────────────────────────────────
+function LoanBorrow({ stock, user, toast, loans, refreshAll }) {
+  const [prodId, setProdId] = useState("");
+  const [size, setSize] = useState("");
+  const [qty, setQty] = useState("");
+  const [borrower, setBorrower] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [payMethod, setPayMethod] = useState({}); // loanId -> "cash"|"card", for the invoice step
+
+  const selProd = stock.find(p=>p.id===prodId);
+  const selVariant = selProd?.variants.find(v=>v.size===size);
+
+  const bookOut = async () => {
+    if (!prodId||!size||!qty||!borrower.trim()) { toast("✗ Select product, size, quantity and who it's going to","error"); return; }
+    const n = parseInt(qty);
+    if (!n||n<1) { toast("✗ Invalid quantity","error"); return; }
+    if (!selVariant?.id) { toast("✗ Select a valid product and size","error"); return; }
+    setSaving(true);
+    try {
+      await createLoanRPC(selVariant.id, n, borrower.trim(), note.trim(), user.username);
+      await refreshAll();
+      toast(`✓ Booked out — ${n} × ${selProd.category} ${size} to ${borrower.trim()}`,"success");
+      setQty(""); setBorrower(""); setNote("");
+    } catch (err) {
+      if (isStockError(err)) toast(`✗ Not enough stock — only ${selVariant.qty} on hand`,"error");
+      else toast(`✗ Couldn't save — ${err?.message || "unknown error"}`,"error");
+    }
+    setSaving(false);
+  };
+
+  const markReturned = async (loan) => {
+    if (!window.confirm(`Mark ${loan.qty} × ${loan.category} ${loan.size} as returned by ${loan.borrower}? This adds it back to stock.`)) return;
+    try {
+      await returnLoanRPC(loan.id, user.username);
+      await refreshAll();
+      toast(`✓ Returned — ${loan.qty} × ${loan.category} ${loan.size} back in stock`,"success");
+    } catch (err) {
+      toast(`✗ Couldn't save — ${err?.message || "unknown error"}`,"error");
+    }
+  };
+
+  const convertToInvoice = async (loan) => {
+    const method = payMethod[loan.id] || "cash";
+    if (!window.confirm(`Not returned — invoice ${loan.borrower} for ${loan.qty} × ${loan.category} ${loan.size} (${fmt(loan.price*loan.qty)}, ${method})? Stock stays as-is — it's already booked out.`)) return;
+    try {
+      const invId = await invoiceLoanRPC(loan.id, user.username, method);
+      await refreshAll();
+      toast(`✓ Invoiced — ${invId}`,"success");
+    } catch (err) {
+      toast(`✗ Couldn't save — ${err?.message || "unknown error"}`,"error");
+    }
+  };
+
+  const open = loans.filter(l=>l.status==="out");
+  const resolved = loans.filter(l=>l.status!=="out");
+
+  return (
+    <div className="adj-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24}}>
+      <div>
+        <p style={{fontSize:13,color:"#888",marginBottom:16,maxWidth:420}}>
+          Book stock out on loan — it comes off the shelf straight away. When it's resolved, mark it either
+          <strong> Returned</strong> (back into stock) or <strong>Invoice</strong> (kept, becomes a real sale —
+          stock doesn't move again since it already left when booked out).
+        </p>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Product</label>
+          <select className="field-input" value={prodId} onChange={e=>{setProdId(e.target.value);setSize("");}}>
+            <option value="">Select product…</option>
+            {stock.map(p=><option key={p.id} value={p.id}>{p.category}</option>)}
+          </select>
+        </div>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Size</label>
+          <select className="field-input" value={size} onChange={e=>setSize(e.target.value)} disabled={!selProd}>
+            <option value="">Select size…</option>
+            {selProd?.variants.map(v=><option key={v.size} value={v.size}>{v.size} ({v.qty} in stock)</option>)}
+          </select>
+        </div>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Quantity</label>
+          <input className="field-input" type="number" min="1" value={qty} onChange={e=>setQty(e.target.value)} style={{fontFamily:"'JetBrains Mono'"}} />
+        </div>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Borrower / Going To</label>
+          <input className="field-input" placeholder="e.g. Site foreman, Acme Construction" value={borrower} onChange={e=>setBorrower(e.target.value)} />
+        </div>
+        <div style={{marginBottom:20}}>
+          <label className="sec-label">Note (optional)</label>
+          <input className="field-input" placeholder="e.g. Expected back Friday" value={note} onChange={e=>setNote(e.target.value)} />
+        </div>
+        <button onClick={bookOut} disabled={saving}
+          style={{background:saving?"#555":"linear-gradient(135deg,#FFD700,#c9a84c)",color:saving?"#999":"#000",fontWeight:900,
+            fontSize:16,letterSpacing:2,textTransform:"uppercase",padding:"13px 28px",border:"none",borderRadius:4}}>
+          {saving?"Booking out…":"Book Stock Out"}
+        </button>
+      </div>
+
+      <div>
+        <p className="sec-label" style={{marginBottom:10}}>Currently Out ({open.length})</p>
+        {open.length===0
+          ? <p style={{color:"#444",fontSize:14,marginBottom:24}}>Nothing out on loan right now.</p>
+          : <div style={{display:"flex",flexDirection:"column",gap:8,marginBottom:28}}>
+              {open.map(l=>(
+                <div key={l.id} style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"12px 14px"}}>
+                  <div style={{color:"#d0d0c8",fontSize:14,marginBottom:2}}>
+                    <strong>{l.qty} × {l.category}</strong> / {l.size} — to <strong>{l.borrower}</strong>
+                  </div>
+                  {l.note && <div style={{color:"#888",fontSize:12,marginBottom:4}}>{l.note}</div>}
+                  <div className="mono" style={{color:"#666",fontSize:11,marginBottom:8}}>Booked out {l.createdAt} by {l.cashier}</div>
+                  <div style={{display:"flex",gap:8,alignItems:"center",flexWrap:"wrap"}}>
+                    <button onClick={()=>markReturned(l)}
+                      style={{background:"#27ae60",color:"#fff",border:"none",borderRadius:4,padding:"7px 14px",fontWeight:700,fontSize:12}}>
+                      ✓ Mark Returned
+                    </button>
+                    <select value={payMethod[l.id]||"cash"} onChange={e=>setPayMethod(p=>({...p,[l.id]:e.target.value}))}
+                      className="field-input" style={{width:"auto",padding:"6px 8px",fontSize:12}}>
+                      <option value="cash">Cash</option>
+                      <option value="card">Card</option>
+                    </select>
+                    <button onClick={()=>convertToInvoice(l)}
+                      style={{background:"#222",color:"#c9a84c",border:"1px solid #c9a84c",borderRadius:4,padding:"7px 14px",fontWeight:700,fontSize:12}}>
+                      🧾 Invoice ({fmt(l.price*l.qty)})
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+        }
+
+        <p className="sec-label" style={{marginBottom:10}}>Resolved</p>
+        {resolved.length===0
+          ? <p style={{color:"#444",fontSize:14}}>Nothing resolved yet.</p>
+          : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {resolved.map(l=>(
+                <div key={l.id} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                  <span style={{color:"#d0d0c8"}}>{l.qty} × {l.category} / {l.size} — {l.borrower}</span>
+                  <span className={`badge ${l.status==="returned"?"badge-green":"badge-gold"}`} style={{marginLeft:8}}>
+                    {l.status==="returned"?"RETURNED":`INVOICED ${l.saleId||""}`}
+                  </span>
+                  <div style={{color:"#555",fontSize:11,marginTop:2}}>by {l.resolvedBy} · {l.resolvedAt}</div>
+                </div>
+              ))}
+            </div>
+        }
+      </div>
+    </div>
+  );
+}
+
 // ─── Stock Screen ─────────────────────────────────────────────────────────────
-function StockScreen({ stock, user, toast, adjLog, refreshAll }) {
+function StockScreen({ stock, user, toast, adjLog, loans, refreshAll }) {
   const [tab, setTab] = useState("view");
-  const tabs = [{key:"view",label:"📦 View Stock"},{key:"add",label:"➕ Add Product"},{key:"adjust",label:"🔧 Adjustments"},{key:"take",label:"📋 Stock Take"}];
+  const tabs = [{key:"view",label:"📦 View Stock"},{key:"add",label:"➕ Add Product"},{key:"adjust",label:"🔧 Adjustments"},
+    {key:"take",label:"📋 Stock Take"},{key:"loan",label:"🤝 Loan / Borrow"}];
   return (
     <div style={{padding:24}}>
       <div className="stock-tab-bar" style={{display:"flex",gap:4,marginBottom:24,borderBottom:"1px solid #2a2a2a",overflowX:"auto"}}>
@@ -1202,6 +1354,7 @@ function StockScreen({ stock, user, toast, adjLog, refreshAll }) {
       {tab==="add"    &&<AddProduct toast={toast} refreshAll={refreshAll} />}
       {tab==="adjust" &&<Adjustments stock={stock} user={user} toast={toast} log={adjLog} refreshAll={refreshAll} />}
       {tab==="take"   &&<StockTake stock={stock} user={user} toast={toast} refreshAll={refreshAll} />}
+      {tab==="loan"   &&<LoanBorrow stock={stock} user={user} toast={toast} loans={loans} refreshAll={refreshAll} />}
     </div>
   );
 }
@@ -1687,6 +1840,7 @@ export default function App() {
   const [stock, setStock]         = useState(()=> CACHE.stock || []);
   const [sales, setSales]         = useState(()=> CACHE.sales || []);
   const [adjLog, setAdjLog]       = useState(()=> CACHE.adjLog || []);
+  const [loans, setLoans]         = useState(()=> CACHE.loans || []);
   const [invoice, setInvoice]     = useState(null);
   const [loading, setLoading]     = useState(SUPABASE_CONFIGURED);
   const [online, setOnline]       = useState(navigator.onLine);
@@ -1707,8 +1861,8 @@ export default function App() {
     if (!SUPABASE_CONFIGURED) return;
     try {
       const data = await fetchAllData();
-      setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog);
-      saveCache(data.stock, data.sales, data.adjLog);
+      setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog); setLoans(data.loans);
+      saveCache(data.stock, data.sales, data.adjLog, data.loans);
       setOnline(true);
     } catch (err) {
       console.error("Refresh failed", err);
@@ -1776,7 +1930,7 @@ export default function App() {
       "adjustment history for EVERY device connected to this app — not just this one. Use this to " +
       "start a genuinely new event. Continue?"
     )) return;
-    downloadBackup(stock, sales, adjLog);
+    downloadBackup(stock, sales, adjLog, loans);
     try {
       await wipeAllDataRPC();
       await refreshAll();
@@ -1870,14 +2024,14 @@ export default function App() {
     <>
       <TestBanner/>
       <Header user={user} screen={activeNav} setScreen={navTo} onLogout={logout} stock={stock} sales={sales}
-        adjLog={adjLog} onResetAll={resetAllData} online={online} queueCount={queueCount} syncIssuesCount={syncIssues.length}/>
+        adjLog={adjLog} loans={loans} onResetAll={resetAllData} online={online} queueCount={queueCount} syncIssuesCount={syncIssues.length}/>
       <Toasts toasts={toasts} dismiss={dismiss}/>
       {screen==="pos" &&
         <POSScreen stock={stock} user={user} toast={toast} onCompleteSale={completeSaleFlow} onSaleComplete={onSaleComplete}/>}
       {screen==="invoice" && invoice &&
         <InvoiceView invoice={invoice} onBack={()=>{setInvoice(null);setScreen("pos");}}/>}
       {screen==="stock" && user.role==="admin" &&
-        <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} refreshAll={refreshAll}/>}
+        <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll}/>}
       {screen==="reconcile" && user.role==="admin" &&
         <Reconcile stock={stock} sales={sales} toast={toast}/>}
       {screen==="sales" && !invoice &&

@@ -12,14 +12,15 @@ const QUEUE_KEY = "impi_pos_offline_queue_v1";
 export async function fetchAllData() {
   const [{ data: products, error: pErr }, { data: variants, error: vErr },
          { data: sales, error: sErr }, { data: saleItems, error: siErr },
-         { data: adjustments, error: aErr }] = await Promise.all([
+         { data: adjustments, error: aErr }, { data: loans, error: lErr }] = await Promise.all([
     supabase.from("products").select("*").order("created_at", { ascending: true }),
     supabase.from("variants").select("*"),
     supabase.from("sales").select("*").order("created_at", { ascending: true }),
     supabase.from("sale_items").select("*"),
     supabase.from("adjustments").select("*").order("created_at", { ascending: false }),
+    supabase.from("loans").select("*").order("created_at", { ascending: false }),
   ]);
-  if (pErr||vErr||sErr||siErr||aErr) throw (pErr||vErr||sErr||siErr||aErr);
+  if (pErr||vErr||sErr||siErr||aErr||lErr) throw (pErr||vErr||sErr||siErr||aErr||lErr);
 
   const stock = (products||[]).map(p => ({
     id: p.id, category: p.category, sku: p.sku,
@@ -42,7 +43,15 @@ export async function fetchAllData() {
     delta:a.delta, adjType:a.adj_type, note:a.note||"", cashier:a.cashier, before:a.before, after:a.after,
   }));
 
-  return { stock, sales: salesOut, adjLog };
+  const loansOut = (loans||[]).map(l => ({
+    id:l.id, variantId:l.variant_id, productId:l.product_id, category:l.category, sku:l.sku, size:l.size,
+    qty:l.qty, price:Number(l.price), borrower:l.borrower, note:l.note||"", status:l.status,
+    cashier:l.cashier, resolvedBy:l.resolved_by, saleId:l.sale_id,
+    createdAt: new Date(l.created_at).toLocaleString("en-ZA"),
+    resolvedAt: l.resolved_at ? new Date(l.resolved_at).toLocaleString("en-ZA") : null,
+  }));
+
+  return { stock, sales: salesOut, adjLog, loans: loansOut };
 }
 
 // ── Realtime — refetch-on-change (simple, robust, fine at this scale) ──────
@@ -53,6 +62,7 @@ export function subscribeRealtime(onChange) {
     .on("postgres_changes", { event:"*", schema:"public", table:"sales" }, onChange)
     .on("postgres_changes", { event:"*", schema:"public", table:"sale_items" }, onChange)
     .on("postgres_changes", { event:"*", schema:"public", table:"adjustments" }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"loans" }, onChange)
     .subscribe();
   return () => supabase.removeChannel(channel);
 }
@@ -99,6 +109,27 @@ export async function completeSaleRPC(cashier, client, items, subtotal, vat, tot
 export async function wipeAllDataRPC() {
   const { error } = await supabase.rpc("wipe_all_data");
   if (error) throw error;
+}
+
+export async function createLoanRPC(variantId, qty, borrower, note, cashier) {
+  const { data, error } = await supabase.rpc("create_loan", {
+    p_variant_id: variantId, p_qty: qty, p_borrower: borrower, p_note: note||"", p_cashier: cashier,
+  });
+  if (error) throw error;
+  return data; // new loan id
+}
+
+export async function returnLoanRPC(loanId, cashier) {
+  const { error } = await supabase.rpc("return_loan", { p_loan_id: loanId, p_cashier: cashier });
+  if (error) throw error;
+}
+
+export async function invoiceLoanRPC(loanId, cashier, paymentMethod) {
+  const { data, error } = await supabase.rpc("invoice_loan", {
+    p_loan_id: loanId, p_cashier: cashier, p_payment_method: paymentMethod||"cash",
+  });
+  if (error) throw error;
+  return data; // new invoice id
 }
 
 // Insufficient-stock errors from the DB functions start with this marker —
