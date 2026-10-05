@@ -5,7 +5,7 @@ import { SUPABASE_CONFIGURED } from "./supabase.js";
 import {
   fetchAllData, subscribeRealtime, addProduct as addProductAPI,
   applyAdjustmentRPC, setStockTakeRPC, completeSaleRPC, wipeAllDataRPC,
-  createLoanRPC, returnLoanRPC, invoiceLoanRPC, fetchEvents, createEvent,
+  createLoanRPC, returnLoanRPC, invoiceLoanRPC, createRefundRPC, fetchEvents, createEvent,
   archiveEvent, unarchiveEvent, deleteEventPermanentlyRPC,
   isStockError, loadQueue, pushToQueue, removeFromQueue,
 } from "./sync.js";
@@ -36,8 +36,8 @@ const loadCache = eventId => {
   try { return JSON.parse(localStorage.getItem(cacheKey(eventId))) || {}; }
   catch { return {}; }
 };
-const saveCache = (eventId, stock, sales, adjLog, loans) => {
-  try { localStorage.setItem(cacheKey(eventId), JSON.stringify({ stock, sales, adjLog, loans, savedAt: new Date().toISOString() })); }
+const saveCache = (eventId, stock, sales, adjLog, loans, refunds) => {
+  try { localStorage.setItem(cacheKey(eventId), JSON.stringify({ stock, sales, adjLog, loans, refunds, savedAt: new Date().toISOString() })); }
   catch (e) { console.error("Cache save failed", e); }
 };
 const debounce = (fn, ms) => { let t; return (...a) => { clearTimeout(t); t = setTimeout(()=>fn(...a), ms); }; };
@@ -430,7 +430,7 @@ function EventSelector({ user, onSelect, toast }) {
     setBusyId(ev.id);
     try {
       const data = await fetchAllData(ev.id);
-      downloadBackup(data.stock, data.sales, data.adjLog, data.loans, ev);
+      downloadBackup(data.stock, data.sales, data.adjLog, data.loans, ev, data.refunds);
       await deleteEventPermanentlyRPC(ev.id);
       toast(`✓ "${ev.name}" permanently deleted — backup downloaded first`,"success");
       load(showArchived);
@@ -522,9 +522,9 @@ function EventSelector({ user, onSelect, toast }) {
 }
 
 // ─── Header ───────────────────────────────────────────────────────────────────
-function downloadBackup(stock, sales, adjLog, loans, event) {
+function downloadBackup(stock, sales, adjLog, loans, event, refunds) {
   const blob = new Blob([JSON.stringify({
-    stock, sales, adjLog, loans, eventId: event?.id, eventName: event?.name, exportedAt: new Date().toISOString(),
+    stock, sales, adjLog, loans, refunds, eventId: event?.id, eventName: event?.name, exportedAt: new Date().toISOString(),
   }, null, 2)], { type: "application/json" });
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
@@ -535,7 +535,7 @@ function downloadBackup(stock, sales, adjLog, loans, event) {
   URL.revokeObjectURL(url);
 }
 
-function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans, onResetAll, online, queueCount, syncIssuesCount, event, onSwitchEvent }) {
+function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans, refunds, onResetAll, online, queueCount, syncIssuesCount, event, onSwitchEvent }) {
   const navItems = [
     { key:"pos",   icon:"⚡", label:"POS" },
     { key:"stock", icon:"📦", label:"Stock", admin:true },
@@ -591,7 +591,7 @@ function Header({ user, screen, setScreen, onLogout, stock, sales, adjLog, loans
           {user.role==="admin"?"ADMIN":"STAFF"}
         </span>
         {user.role==="admin" && (
-          <button onClick={()=>downloadBackup(stock, sales, adjLog, loans, event)} title="Download a backup of all stock and sales data"
+          <button onClick={()=>downloadBackup(stock, sales, adjLog, loans, event, refunds)} title="Download a backup of all stock and sales data"
             style={{background:"#222",color:"#c9a84c",border:"1px solid #333",borderRadius:4,
               padding:"8px 12px",fontWeight:700,fontSize:13,letterSpacing:1}}>
             ⬇ BACKUP
@@ -893,7 +893,9 @@ function POSScreen({ stock, user, toast, onCompleteSale, onSaleComplete }) {
 }
 
 // ─── Invoice View ─────────────────────────────────────────────────────────────
-function InvoiceView({ invoice, onBack }) {
+function InvoiceView({ invoice, onBack, isAdmin, refunds, onIssueRefund, onViewCreditNote }) {
+  const [showRefund, setShowRefund] = useState(false);
+  const myCreditNotes = (refunds||[]).filter(r=>r.saleId===invoice.id);
   const emailInvoice = () => {
     const subject = `Invoice ${invoice.id} – IMPI RMS (Pty) Ltd`;
     const paidBy = invoice.paymentMethod === "card" ? "card" : "cash";
@@ -985,10 +987,33 @@ ${TEST_MODE?'<div class="watermark">⚠ TEST DOCUMENT — NOT A VALID TAX INVOIC
           style={{background:"#222",color:"#d0d0c8",border:"1px solid #333",borderRadius:4,padding:"10px 18px",fontSize:14,fontWeight:700}}>
           ✉ Email Invoice
         </button>
+        {isAdmin && !String(invoice.id).startsWith("PENDING") && (
+          <button onClick={()=>setShowRefund(v=>!v)}
+            style={{background:"#222",color:"#e67e22",border:"1px solid #e67e22",borderRadius:4,padding:"10px 18px",fontSize:14,fontWeight:700}}>
+            ↩ Refund / Credit Note
+          </button>
+        )}
       </div>
       <p className="no-print" style={{fontSize:12,color:"#666",marginTop:-16,marginBottom:20}}>
         Tip: click <strong>Print / Save PDF</strong> first and save the file, then <strong>Email Invoice</strong> opens your mail app pre-filled — just attach the saved PDF and send.
       </p>
+
+      {showRefund && (
+        <RefundPanel invoice={invoice} refunds={refunds||[]} onIssue={onIssueRefund}
+          onCancel={()=>setShowRefund(false)} onDone={cn=>{setShowRefund(false); onViewCreditNote(cn);}} />
+      )}
+
+      {myCreditNotes.length>0 && (
+        <div className="no-print" style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"12px 16px",marginBottom:20,fontSize:13}}>
+          <div className="sec-label" style={{marginBottom:6}}>Credit notes issued against this invoice</div>
+          {myCreditNotes.map(cn=>(
+            <div key={cn.id} onClick={()=>onViewCreditNote(cn)} style={{cursor:"pointer",color:"#d0d0c8",padding:"3px 0"}}>
+              <span className="mono" style={{color:"#e67e22",fontWeight:700}}>{cn.id}</span>
+              {" · "}{fmt(cn.total)} refunded by {cn.method} · {cn.date} <span style={{color:"#666"}}>VIEW →</span>
+            </div>
+          ))}
+        </div>
+      )}
 
       <div style={{background:"#fff",color:"#111",borderRadius:8,padding:"40px 48px",boxShadow:"0 4px 40px rgba(0,0,0,.6)"}}>
         <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24,flexWrap:"wrap",gap:16}}>
@@ -1059,6 +1084,282 @@ ${TEST_MODE?'<div class="watermark">⚠ TEST DOCUMENT — NOT A VALID TAX INVOIC
             ⚠ TEST DOCUMENT — NOT A VALID TAX INVOICE
           </div>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Refund panel (shown on an invoice, admin only) ───────────────────────────
+function RefundPanel({ invoice, refunds, onIssue, onCancel, onDone }) {
+  const key = it => `${it.productId}-${it.size}`;
+  const alreadyRefunded = it => refunds.filter(r=>r.saleId===invoice.id)
+    .flatMap(r=>r.items).filter(i=>i.productId===it.productId && i.size===it.size)
+    .reduce((s,i)=>s+i.qty,0);
+  const lines = invoice.items.map(it=>({...it, left: it.qty - alreadyRefunded(it)}));
+
+  const [qtys, setQtys] = useState({});
+  const [restock, setRestock] = useState({});
+  const [method, setMethod] = useState(invoice.paymentMethod==="card"?"card":"cash");
+  const [reason, setReason] = useState("");
+  const [saving, setSaving] = useState(false);
+
+  const qtyFor = l => Math.max(0, Math.min(l.left, parseInt(qtys[key(l)])||0));
+  const chosen = lines.filter(l=>qtyFor(l)>0);
+  const total = chosen.reduce((s,l)=>s+l.price*qtyFor(l),0);
+  const fullyRefunded = lines.every(l=>l.left<=0);
+  const canIssue = chosen.length>0 && reason.trim().length>0 && !saving;
+
+  const submit = async () => {
+    const items = chosen.map(l=>({
+      productId:l.productId, category:l.category, size:l.size, qty:qtyFor(l), restock: restock[key(l)]!==false,
+    }));
+    if (!window.confirm(`Issue a credit note for ${fmt(total)}, refunded by ${method}, against invoice ${invoice.id}?`)) return;
+    setSaving(true);
+    const res = await onIssue(invoice, items, method, reason.trim());
+    setSaving(false);
+    if (res.ok && res.cn) onDone(res.cn);
+  };
+
+  const th = {fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,color:"#666",padding:"8px",borderBottom:"2px solid #333"};
+  const td = {padding:"8px",borderBottom:"1px solid #222",fontSize:13,color:"#d0d0c8"};
+
+  return (
+    <div className="no-print" style={{background:"#141414",border:"2px solid #e67e22",borderRadius:8,padding:20,marginBottom:24}}>
+      <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:12}}>
+        <span style={{fontWeight:800,fontSize:16,textTransform:"uppercase",letterSpacing:1,color:"#e67e22"}}>
+          Refund / Credit Note — {invoice.id}
+        </span>
+        <button onClick={onCancel} style={{background:"none",border:"none",color:"#888",fontSize:13}}>✕ Close</button>
+      </div>
+
+      {fullyRefunded
+        ? <p style={{color:"#888",fontSize:14}}>Every item on this invoice has already been refunded.</p>
+        : <>
+            <p style={{fontSize:12,color:"#888",marginBottom:12}}>
+              Enter how many of each item are being refunded. Refunds are at the price the customer paid on this invoice.
+              Tick <strong>Back to stock</strong> only for items that are returned and fit to resell.
+            </p>
+            <div style={{overflowX:"auto"}}>
+              <table style={{width:"100%",borderCollapse:"collapse",marginBottom:16}}>
+                <thead><tr>
+                  <th style={{...th,textAlign:"left"}}>Item</th>
+                  <th style={{...th,textAlign:"right"}}>Sold</th>
+                  <th style={{...th,textAlign:"right"}}>Left to refund</th>
+                  <th style={{...th,textAlign:"right"}}>Refund qty</th>
+                  <th style={{...th,textAlign:"center"}}>Back to stock</th>
+                </tr></thead>
+                <tbody>
+                  {lines.map(l=>(
+                    <tr key={key(l)} style={{opacity:l.left<=0?0.4:1}}>
+                      <td style={td}>{l.category} <span className="badge badge-gold" style={{marginLeft:6}}>{l.size}</span></td>
+                      <td className="mono" style={{...td,textAlign:"right"}}>{l.qty}</td>
+                      <td className="mono" style={{...td,textAlign:"right"}}>{Math.max(0,l.left)}</td>
+                      <td style={{...td,textAlign:"right"}}>
+                        <input type="number" min="0" max={Math.max(0,l.left)} disabled={l.left<=0}
+                          value={qtys[key(l)]??""} placeholder="0"
+                          onChange={e=>setQtys(p=>({...p,[key(l)]:e.target.value}))}
+                          className="field-input mono" style={{width:70,padding:"6px 8px",textAlign:"right"}} />
+                      </td>
+                      <td style={{...td,textAlign:"center"}}>
+                        <input type="checkbox" disabled={l.left<=0} checked={restock[key(l)]!==false}
+                          onChange={e=>setRestock(p=>({...p,[key(l)]:e.target.checked}))} />
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:16,marginBottom:16}} className="client-grid">
+              <div>
+                <label className="sec-label">Refunded by</label>
+                <div style={{display:"flex",gap:8,marginTop:4}}>
+                  {[["cash","💵 Cash"],["card","💳 Card"]].map(([k,label])=>(
+                    <button key={k} onClick={()=>setMethod(k)}
+                      style={{flex:1,padding:"10px 0",borderRadius:4,fontWeight:800,fontSize:13,
+                        border:`2px solid ${method===k?"#c9a84c":"#333"}`,
+                        background:method===k?"#c9a84c":"#181818",color:method===k?"#000":"#888"}}>
+                      {label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+              <div>
+                <label className="sec-label">Reason (required)</label>
+                <input className="field-input" placeholder="e.g. Customer returned — wrong size" value={reason}
+                  onChange={e=>setReason(e.target.value)} />
+              </div>
+            </div>
+
+            <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",flexWrap:"wrap",gap:12}}>
+              <div style={{fontSize:20,fontWeight:900,color:"#e67e22"}}>
+                REFUND TOTAL <span className="mono">{fmt(total)}</span>
+              </div>
+              <button onClick={submit} disabled={!canIssue}
+                style={{background:canIssue?"#e67e22":"#333",color:canIssue?"#000":"#666",fontWeight:900,fontSize:15,
+                  letterSpacing:2,textTransform:"uppercase",padding:"12px 24px",border:"none",borderRadius:4}}>
+                {saving?"Issuing…":"Issue Credit Note"}
+              </button>
+            </div>
+            {method==="card" && (
+              <p style={{fontSize:11,color:"#888",marginTop:10}}>
+                This records the refund only — the money still has to be returned to the customer's card on your card machine.
+              </p>
+            )}
+          </>
+      }
+    </div>
+  );
+}
+
+// ─── Credit note document ────────────────────────────────────────────────────
+function CreditNoteView({ cn, onBack }) {
+  const methodLabel = cn.method==="card" ? "Card" : "Cash";
+
+  const emailCreditNote = () => {
+    const subject = `Credit Note ${cn.id} – IMPI RMS (Pty) Ltd`;
+    const body =
+`Dear ${cn.client.name || "Customer"},
+
+Please find your credit note ${cn.id} attached, relating to invoice ${cn.saleId}.
+
+Amount refunded: ${fmt(cn.total).replace("R ", "R")} (by ${methodLabel.toLowerCase()})
+
+If you have any questions, simply reply to this email or call us on 012 543 0640.
+
+Kind regards,
+
+Shane Steynfaardt
+IMPI RMS (Pty) Ltd
+012 543 0640 | info@impi-secure.co.za
+www.impi-secure.co.za`;
+    window.location.href = `mailto:${cn.client.email||""}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+  };
+
+  const print = () => {
+    const html = `<!DOCTYPE html><html><head><title>Credit Note ${cn.id}</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;700;900&family=JetBrains+Mono&display=swap" rel="stylesheet"/>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:'Barlow Condensed',Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:760px;margin:0 auto;}
+.mono{font-family:'JetBrains Mono',monospace;}
+table{width:100%;border-collapse:collapse;margin:20px 0;}
+th{font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:1px;padding:8px;border-bottom:2px solid #111;text-align:left;}
+td{padding:10px 8px;border-bottom:1px solid #ddd;font-size:14px;}
+.right{text-align:right;}
+</style></head><body>
+<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:24px;flex-wrap:wrap;gap:16px;">
+  <div>
+    <img src="${BASE}impi-logo.svg" alt="IMPI" style="height:60px;" onerror="this.style.display='none'" />
+    <div style="margin-top:8px;line-height:1.7;font-size:13px;">
+      <strong>IMPI RMS (Pty) Ltd</strong><br/>
+      10 Kosmos Crescent, Rynoue AH, Roodeplaat, Pretoria<br/>
+      info@impi-secure.co.za · 012 543 0640<br/>
+      www.impi-secure.co.za
+    </div>
+  </div>
+  <div style="text-align:right;">
+    <h1 style="font-family:'Barlow Condensed';font-weight:900;font-size:30px;">CREDIT NOTE</h1>
+    <div class="mono" style="font-size:20px;font-weight:700;color:#c9a84c;">${cn.id}</div>
+    <div style="font-size:13px;color:#555;margin-top:4px;">Date: ${cn.date}</div>
+    <div style="font-size:13px;color:#555;">Against invoice: ${cn.saleId}</div>
+    <div style="font-size:13px;color:#555;">Processed by: ${cn.cashier}</div>
+    <div style="font-size:13px;color:#555;">Refunded by: ${methodLabel}</div>
+  </div>
+</div>
+<div style="background:#f8f8f8;border:1px solid #ddd;border-radius:4px;padding:12px 16px;margin-bottom:24px;font-size:14px;">
+  <strong style="font-size:11px;letter-spacing:1px;text-transform:uppercase;color:#666;">Credited To</strong><br/>
+  ${cn.client.name||""}${cn.client.company?` · ${cn.client.company}`:""}${cn.client.email?` · ${cn.client.email}`:""}${cn.client.phone?` · ${cn.client.phone}`:""}
+</div>
+<table>
+<thead><tr><th>Description</th><th>Size</th><th class="right">Qty</th><th class="right">Unit Price</th><th class="right">Total</th></tr></thead>
+<tbody>${cn.items.map(i=>`<tr><td>${i.category}</td><td>${i.size}</td><td class="right mono">${i.qty}</td><td class="right mono">${fmt(i.price)}</td><td class="right mono">${fmt(i.price*i.qty)}</td></tr>`).join("")}</tbody>
+</table>
+<table style="max-width:320px;margin-left:auto;">
+<tbody><tr><td style="font-weight:900;font-size:16px;">TOTAL CREDITED</td>
+<td class="right mono" style="font-weight:900;font-size:16px;color:#c9a84c;">${fmt(cn.total)}</td></tr></tbody>
+</table>
+${cn.reason?`<p style="margin-top:12px;font-size:13px;color:#555;"><strong>Reason:</strong> ${cn.reason}</p>`:""}
+<p style="margin-top:28px;font-size:13px;color:#777;">IMPI RMS (Pty) Ltd · Co. Reg: 2017/099360/07 · PSIRA: 2689596</p>
+<script>window.print();<\/script>
+</body></html>`;
+    const w = window.open("","_blank");
+    w.document.write(html); w.document.close();
+  };
+
+  const btn = {background:"#222",color:"#d0d0c8",border:"1px solid #333",borderRadius:4,padding:"10px 18px",fontSize:14,fontWeight:700};
+  return (
+    <div style={{padding:24,maxWidth:820,margin:"0 auto"}}>
+      <div className="no-print" style={{display:"flex",gap:10,marginBottom:24,flexWrap:"wrap"}}>
+        <button onClick={onBack} style={btn}>← Back</button>
+        <button onClick={print} style={btn}>🖨 Print / Save PDF</button>
+        <button onClick={emailCreditNote} style={btn}>✉ Email Credit Note</button>
+      </div>
+
+      <div style={{background:"#fff",color:"#111",borderRadius:8,padding:"40px 48px",boxShadow:"0 4px 40px rgba(0,0,0,.6)"}}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"flex-start",marginBottom:24,flexWrap:"wrap",gap:16}}>
+          <div>
+            <Logo h={60} />
+            <div style={{fontSize:13,lineHeight:1.8,color:"#333",marginTop:8}}>
+              <strong>IMPI RMS (Pty) Ltd</strong><br/>
+              10 Kosmos Crescent, Rynoue AH, Roodeplaat, Pretoria<br/>
+              info@impi-secure.co.za · 012 543 0640<br/>
+              www.impi-secure.co.za
+            </div>
+          </div>
+          <div style={{textAlign:"right"}}>
+            <h1 style={{fontFamily:"'Barlow Condensed'",fontWeight:900,fontSize:30,margin:0}}>CREDIT NOTE</h1>
+            <div className="mono" style={{fontSize:20,fontWeight:700,color:"#c9a84c",marginTop:4}}>{cn.id}</div>
+            <div style={{fontSize:13,color:"#555",marginTop:6}}>Date: {cn.date}</div>
+            <div style={{fontSize:13,color:"#555"}}>Against invoice: {cn.saleId}</div>
+            <div style={{fontSize:13,color:"#555"}}>Processed by: {cn.cashier}</div>
+            <div style={{fontSize:13,color:"#555"}}>Refunded by: {methodLabel}</div>
+          </div>
+        </div>
+
+        <div style={{background:"#f8f8f8",border:"1px solid #ddd",borderRadius:4,padding:"12px 16px",marginBottom:24,fontSize:13}}>
+          <strong style={{fontSize:11,letterSpacing:1,textTransform:"uppercase",color:"#666"}}>Credited To</strong><br/>
+          <span style={{fontSize:15}}>
+            {cn.client.name}
+            {cn.client.company&&` · ${cn.client.company}`}
+            {cn.client.email&&` · ${cn.client.email}`}
+            {cn.client.phone&&` · ${cn.client.phone}`}
+          </span>
+        </div>
+
+        <table style={{width:"100%",borderCollapse:"collapse",marginBottom:24}}>
+          <thead><tr>{["Description","Size","Qty","Unit Price","Total"].map((h,i)=>(
+            <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
+              color:"#555",padding:"8px",borderBottom:"2px solid #111",textAlign:i>=2?"right":"left"}}>{h}</th>
+          ))}</tr></thead>
+          <tbody>
+            {cn.items.map((item,i)=>(
+              <tr key={i}>
+                <td style={{padding:"10px 8px",borderBottom:"1px solid #eee"}}>{item.category}</td>
+                <td style={{padding:"10px 8px",borderBottom:"1px solid #eee"}}>{item.size}</td>
+                <td className="mono" style={{padding:"10px 8px",borderBottom:"1px solid #eee",textAlign:"right"}}>{item.qty}</td>
+                <td className="mono" style={{padding:"10px 8px",borderBottom:"1px solid #eee",textAlign:"right"}}>{fmt(item.price)}</td>
+                <td className="mono" style={{padding:"10px 8px",borderBottom:"1px solid #eee",textAlign:"right"}}>{fmt(item.price*item.qty)}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+
+        <div style={{display:"flex",justifyContent:"flex-end"}}>
+          <table style={{minWidth:300}}><tbody>
+            <tr><td style={{padding:"4px 8px",fontSize:18,fontWeight:900}}>TOTAL CREDITED</td>
+                <td className="mono" style={{padding:"4px 8px",fontSize:18,fontWeight:900,textAlign:"right",color:"#c9a84c"}}>{fmt(cn.total)}</td></tr>
+          </tbody></table>
+        </div>
+
+        {cn.reason && <div style={{marginTop:12,fontSize:13,color:"#555"}}><strong>Reason:</strong> {cn.reason}</div>}
+        <div style={{marginTop:28,fontSize:13,color:"#777",borderTop:"1px solid #eee",paddingTop:14}}>
+          IMPI RMS (Pty) Ltd · Co. Reg: 2017/099360/07 · PSIRA: 2689596
+        </div>
+      </div>
+
+      <div className="no-print" style={{marginTop:16,fontSize:12,color:"#666"}}>
+        Back to stock: {cn.items.map(i=>`${i.qty} × ${i.category} ${i.size} — ${i.restock?"yes":"no"}`).join(" · ")}
       </div>
     </div>
   );
@@ -1548,13 +1849,15 @@ function StockScreen({ stock, user, toast, adjLog, loans, refreshAll, eventId })
 }
 
 // ─── Sales Screen ─────────────────────────────────────────────────────────────
-function SalesScreen({ sales, onView }) {
+function SalesScreen({ sales, refunds, onView, onViewCreditNote }) {
   const rev = sales.reduce((s,sale)=>s+sale.total,0);
+  const refunded = (refunds||[]).reduce((s,r)=>s+r.total,0);
   const units = sales.reduce((s,sale)=>s+sale.items.reduce((ss,i)=>ss+i.qty,0),0);
   return (
     <div style={{padding:24}}>
-      <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:16,marginBottom:28}}>
-        {[{l:"INVOICES",v:String(sales.length)},{l:"REVENUE",v:fmt(rev)},{l:"UNITS SOLD",v:String(units)}].map(c=>(
+      <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(180px,1fr))",gap:16,marginBottom:28}}>
+        {[{l:"INVOICES",v:String(sales.length)},{l:"REVENUE",v:fmt(rev)},{l:"UNITS SOLD",v:String(units)},
+          ...(refunded>0?[{l:"REFUNDED",v:fmt(refunded)},{l:"NET REVENUE",v:fmt(rev-refunded)}]:[])].map(c=>(
           <div key={c.l} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:8,padding:"20px 24px"}}>
             <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:8}}>{c.l}</div>
             <div className="mono" style={{fontSize:28,fontWeight:700,color:"#c9a84c"}}>{c.v}</div>
@@ -1589,6 +1892,31 @@ function SalesScreen({ sales, onView }) {
             })}
           </div>
       }
+
+      {(refunds||[]).length>0 && (
+        <>
+          <p className="sec-label" style={{marginTop:32,marginBottom:10}}>Credit Notes</p>
+          <div style={{display:"flex",flexDirection:"column",gap:6}}>
+            {(refunds||[]).map(cn=>(
+              <div key={cn.id} onClick={()=>onViewCreditNote(cn)}
+                onMouseEnter={e=>e.currentTarget.style.borderColor="#e67e22"}
+                onMouseLeave={e=>e.currentTarget.style.borderColor="#2a2a2a"}
+                style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:6,padding:"12px 16px",cursor:"pointer",
+                  display:"flex",alignItems:"center",gap:12,flexWrap:"wrap"}}>
+                <span className="mono" style={{color:"#e67e22",fontWeight:700,minWidth:110}}>{cn.id}</span>
+                <span style={{color:"#888",fontSize:13,minWidth:100}}>{cn.date}</span>
+                <span style={{color:"#888",fontSize:13}}>vs {cn.saleId}</span>
+                <span style={{color:"#d0d0c8",fontSize:14,flex:1}}>{cn.client.name}{cn.reason?` — ${cn.reason}`:""}</span>
+                <span className={`badge ${cn.method==="card"?"badge-blue":"badge-green"}`} style={{fontSize:10}}>
+                  {cn.method==="card"?"💳 CARD":"💵 CASH"}
+                </span>
+                <span className="mono" style={{color:"#e67e22",fontWeight:700}}>− {fmt(cn.total)}</span>
+                <span style={{color:"#666",fontSize:12,fontWeight:700,letterSpacing:1}}>VIEW →</span>
+              </div>
+            ))}
+          </div>
+        </>
+      )}
     </div>
   );
 }
@@ -1617,15 +1945,17 @@ function flattenStock(stockArr) {
   return map;
 }
 
-function buildReconciliation(openingData, closingStock, closingSales) {
+function buildReconciliation(openingData, closingStock, closingSales, closingRefunds) {
   const openMap = flattenStock(openingData.stock);
   const closeMap = flattenStock(closingStock);
   const openIds = new Set((openingData.sales||[]).map(s=>s.id));
   const newSales = (closingSales||[]).filter(s => !openIds.has(s.id));
+  const openRefundIds = new Set((openingData.refunds||[]).map(r=>r.id));
+  const newRefunds = (closingRefunds||[]).filter(r => !openRefundIds.has(r.id));
 
   const soldMap = {};
   const cashierMap = {};
-  const paymentMap = { cash:{units:0,revenue:0,invoices:0}, card:{units:0,revenue:0,invoices:0} };
+  const paymentMap = { cash:{units:0,revenue:0,invoices:0,refunds:0}, card:{units:0,revenue:0,invoices:0,refunds:0} };
   newSales.forEach(sale => {
     cashierMap[sale.cashier] = cashierMap[sale.cashier] || { units:0, revenue:0, invoices:0 };
     cashierMap[sale.cashier].revenue += sale.total;
@@ -1640,6 +1970,15 @@ function buildReconciliation(openingData, closingStock, closingSales) {
       paymentMap[pm].units += item.qty;
     });
   });
+
+  // Refunds: money paid back reduces that method's takings. Items that went
+  // back onto the shelf also cancel out against units sold, otherwise the
+  // returned stock would show up as a false variance.
+  newRefunds.forEach(r => {
+    paymentMap[r.method==="card"?"card":"cash"].refunds += r.total;
+    r.items.forEach(i => { if (i.restock) { const k = stockKey(i); soldMap[k] = (soldMap[k]||0) - i.qty; } });
+  });
+  const refundTotal = newRefunds.reduce((s,r)=>s+r.total,0);
 
   const allKeys = new Set([...Object.keys(openMap), ...Object.keys(closeMap), ...Object.keys(soldMap)]);
   const rows = [...allKeys].map(k => {
@@ -1656,16 +1995,16 @@ function buildReconciliation(openingData, closingStock, closingSales) {
   }), {depleted:0,sold:0,variance:0});
   const revenue = newSales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, cashierMap, paymentMap, newSalesCount: newSales.length };
+  return { rows, totals, revenue, refundTotal, netRevenue: revenue-refundTotal, newRefunds, cashierMap, paymentMap, newSalesCount: newSales.length };
 }
 
 // Straight "where do things stand right now" report — every sale currently on
 // record, cash/card and per-staff breakdowns, and current stock on hand.
 // Needs no opening backup, since it's not computing a before/after variance.
-function buildSummary(stock, sales, loans) {
+function buildSummary(stock, sales, loans, refunds) {
   const soldMap = {};
   const cashierMap = {};
-  const paymentMap = { cash:{units:0,revenue:0,invoices:0}, card:{units:0,revenue:0,invoices:0} };
+  const paymentMap = { cash:{units:0,revenue:0,invoices:0,refunds:0}, card:{units:0,revenue:0,invoices:0,refunds:0} };
   sales.forEach(sale => {
     cashierMap[sale.cashier] = cashierMap[sale.cashier] || { units:0, revenue:0, invoices:0 };
     cashierMap[sale.cashier].revenue += sale.total;
@@ -1681,6 +2020,13 @@ function buildSummary(stock, sales, loans) {
     });
   });
 
+  const refundMap = {};
+  (refunds||[]).forEach(r => {
+    paymentMap[r.method==="card"?"card":"cash"].refunds += r.total;
+    r.items.forEach(i => { const k = stockKey(i); refundMap[k] = (refundMap[k]||0) + i.qty; });
+  });
+  const refundTotal = (refunds||[]).reduce((s,r)=>s+r.total,0);
+
   const openLoans = (loans||[]).filter(l=>l.status==="out");
   const loanMap = {};
   openLoans.forEach(l => {
@@ -1691,17 +2037,17 @@ function buildSummary(stock, sales, loans) {
   const rows = [];
   stock.forEach(p => p.variants.forEach(v => {
     const k = stockKey({category:p.category, sku:p.sku, size:v.size});
-    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, remaining: v.qty, onLoan: loanMap[k]||0 });
+    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, refunded: refundMap[k]||0, remaining: v.qty, onLoan: loanMap[k]||0 });
   }));
   rows.sort((a,b)=> a.category.localeCompare(b.category) || a.size.localeCompare(b.size));
 
   const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining, onLoan:t.onLoan+r.onLoan }), {sold:0,remaining:0,onLoan:0});
   const revenue = sales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
+  return { rows, totals, revenue, refundTotal, refundCount:(refunds||[]).length, creditNotes:(refunds||[]), cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
 }
 
-function Reconcile({ stock, sales, loans, toast, event }) {
+function Reconcile({ stock, sales, loans, refunds, toast, event }) {
   const [mode, setMode] = useState("summary"); // "summary" (no file needed) | "variance" (opening vs closing)
   const [opening, setOpening] = useState(null);
   const [openingName, setOpeningName] = useState("");
@@ -1727,18 +2073,21 @@ function Reconcile({ stock, sales, loans, toast, event }) {
   const closingStock = closingSource==="live" ? stock : closing?.stock;
   const closingSales = closingSource==="live" ? sales : closing?.sales;
   const ready = opening && closingStock && closingSales;
-  const result = ready ? buildReconciliation(opening, closingStock, closingSales) : null;
-  const summary = mode==="summary" ? buildSummary(stock, sales, loans) : null;
+  const closingRefunds = closingSource==="live" ? refunds : (closing?.refunds||[]);
+  const result = ready ? buildReconciliation(opening, closingStock, closingSales, closingRefunds) : null;
+  const summary = mode==="summary" ? buildSummary(stock, sales, loans, refunds) : null;
   const openLoansList = (loans||[]).filter(l=>l.status==="out");
 
   const printSummary = () => {
     if (!summary) return;
     const rowsHtml = summary.rows.map(r=>
-      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.onLoan}</td><td class="right">${r.remaining}</td></tr>`).join("");
+      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.refunded||"—"}</td><td class="right">${r.onLoan}</td><td class="right">${r.remaining}</td></tr>`).join("");
+    const creditHtml = summary.creditNotes.map(c=>
+      `<tr><td>${c.id}</td><td>${c.saleId}</td><td>${c.date}</td><td>${c.client.name||""}</td><td>${c.method==="card"?"Card":"Cash"}</td><td>${c.cashier}</td><td>${c.reason||""}</td><td class="right">${fmt(c.total)}</td></tr>`).join("");
     const cashierHtml = Object.entries(summary.cashierMap).map(([name,c])=>
       `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
     const paymentHtml = Object.entries(summary.paymentMap).map(([method,c])=>
-      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td><td class="right">${c.refunds>0?"− "+fmt(c.refunds):"—"}</td><td class="right">${fmt(c.revenue-c.refunds)}</td></tr>`).join("");
     const loansHtml = summary.openLoans.map(l=>
       `<tr><td>${l.category}</td><td>${l.size}</td><td class="right">${l.qty}</td><td>${l.borrower}</td><td>${l.createdAt}</td><td>${l.note||""}</td></tr>`).join("");
     const html = `<!DOCTYPE html><html><head><title>Sales Summary</title><style>
@@ -1757,19 +2106,23 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <p style="margin-bottom:4px;"><strong>Total units sold:</strong> ${summary.totals.sold}</p>
 <p style="margin-bottom:4px;"><strong>Total units currently on loan:</strong> ${summary.totals.onLoan}</p>
 <p style="margin-bottom:4px;"><strong>Total units remaining on hand:</strong> ${summary.totals.remaining}</p>
-<p style="margin-bottom:20px;"><strong>Total revenue:</strong> ${fmt(summary.revenue)}</p>
+<p style="margin-bottom:${summary.refundCount>0?4:20}px;"><strong>Total revenue:</strong> ${fmt(summary.revenue)}</p>
+${summary.refundCount>0?`<p style="margin-bottom:4px;"><strong>Refunds (credit notes):</strong> − ${fmt(summary.refundTotal)}</p><p style="margin-bottom:20px;"><strong>Net revenue:</strong> ${fmt(summary.revenue-summary.refundTotal)}</p>`:""}
 <h2 style="font-weight:700;color:#111;">By payment method</h2>
-<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
+<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th><th class="right">Refunds</th><th class="right">Net</th></tr></thead>
 <tbody>${paymentHtml}</tbody></table>
 <h2 style="font-weight:700;color:#111;">By staff member</h2>
 <table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
 <tbody>${cashierHtml}</tbody></table>
-<h2 style="font-weight:700;color:#111;">Stock sold vs. on loan vs. on hand</h2>
-<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">On Loan</th><th class="right">Remaining</th></tr></thead>
+<h2 style="font-weight:700;color:#111;">Stock sold vs. refunded vs. on loan vs. on hand</h2>
+<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">Refunded</th><th class="right">On Loan</th><th class="right">Remaining</th></tr></thead>
 <tbody>${rowsHtml}</tbody></table>
 ${summary.openLoans.length>0?`<h2 style="font-weight:700;color:#111;">Currently on loan — reference</h2>
 <table><thead><tr><th>Category</th><th>Size</th><th class="right">Qty</th><th>Borrower</th><th>Booked Out</th><th>Note</th></tr></thead>
 <tbody>${loansHtml}</tbody></table>`:""}
+${summary.creditNotes.length>0?`<h2 style="font-weight:700;color:#111;">Credit notes issued — reference</h2>
+<table><thead><tr><th>No.</th><th>Invoice</th><th>Date</th><th>Client</th><th>Method</th><th>Processed by</th><th>Reason</th><th class="right">Amount</th></tr></thead>
+<tbody>${creditHtml}</tbody></table>`:""}
 <script>window.print();<\/script>
 </body></html>`;
     const w = window.open("","_blank");
@@ -1785,7 +2138,7 @@ ${summary.openLoans.length>0?`<h2 style="font-weight:700;color:#111;">Currently 
     const cashierHtml = Object.entries(result.cashierMap).map(([name,c])=>
       `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
     const paymentHtml = Object.entries(result.paymentMap).map(([method,c])=>
-      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
+      `<tr><td>${method==="card"?"Card":"Cash"}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td><td class="right">${c.refunds>0?"− "+fmt(c.refunds):"—"}</td><td class="right">${fmt(c.revenue-c.refunds)}</td></tr>`).join("");
     const html = `<!DOCTYPE html><html><head><title>Stock Reconciliation</title><style>
 *{box-sizing:border-box;margin:0;padding:0;}
 body{font-family:Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:900px;margin:0 auto;}
@@ -1803,7 +2156,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <p style="margin-bottom:4px;"><strong>Variance:</strong> ${result.totals.variance} ${result.totals.variance!==0?"⚠ investigate":"✓ matches"}</p>
 <p style="margin-bottom:20px;"><strong>Revenue recorded:</strong> ${fmt(result.revenue)}</p>
 <h2 style="font-weight:700;color:#111;">By payment method</h2>
-<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
+<table><thead><tr><th>Method</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th><th class="right">Refunds</th><th class="right">Net</th></tr></thead>
 <tbody>${paymentHtml}</tbody></table>
 <h2 style="font-weight:700;color:#111;">By staff member</h2>
 <table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
@@ -1831,13 +2184,14 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
             Every sale currently on record — cash vs card, per staff member, and what's been sold vs what's
             still on hand — pulled straight from live data. Nothing to upload.
           </p>
-          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(5,1fr)",gap:16,marginBottom:24}}>
+          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:16,marginBottom:24}}>
             {[
               {l:"INVOICES",v:String(summary.invoiceCount)},
               {l:"UNITS SOLD",v:String(summary.totals.sold)},
               {l:"ON LOAN",v:String(summary.totals.onLoan),loan:summary.totals.onLoan>0},
               {l:"UNITS ON HAND",v:String(summary.totals.remaining)},
               {l:"TOTAL REVENUE",v:fmt(summary.revenue)},
+              ...(summary.refundCount>0?[{l:"REFUNDS",v:"− "+fmt(summary.refundTotal),loan:true},{l:"NET REVENUE",v:fmt(summary.revenue-summary.refundTotal)}]:[]),
             ].map(c=>(
               <div key={c.l} style={{background:"#141414",border:`1px solid ${c.loan?"#e67e22":"#2a2a2a"}`,borderRadius:8,padding:"18px 20px"}}>
                 <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:6}}>{c.l}</div>
@@ -1855,7 +2209,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
           <p className="sec-label" style={{marginBottom:10}}>By Payment Method</p>
           <div style={{overflowX:"auto",marginBottom:28}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Method","Invoices","Units","Revenue"].map((h,i)=>(
+              <thead><tr>{["Method","Invoices","Units","Revenue","Refunds","Net"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>0?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -1866,6 +2220,8 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.invoices}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.units}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#c9a84c",fontWeight:700}}>{fmt(c.revenue)}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:c.refunds>0?"#e67e22":"#444"}}>{c.refunds>0?"− "+fmt(c.refunds):"—"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#27ae60",fontWeight:700}}>{fmt(c.revenue-c.refunds)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -1895,7 +2251,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
           <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. On Loan vs. On Hand</p>
           <div style={{overflowX:"auto",marginBottom:28}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Category","Size","Sold","On Loan","Remaining"].map((h,i)=>(
+              <thead><tr>{["Category","Size","Sold","Refunded","On Loan","Remaining"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>1?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -1905,6 +2261,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#d0d0c8"}}>{r.category}</td>
                     <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#888"}}>{r.size}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.sold}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:r.refunded>0?"#e67e22":"#444"}}>{r.refunded||"—"}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
                       color:r.onLoan>0?"#e67e22":"#444",fontWeight:r.onLoan>0?700:400}}>{r.onLoan||"—"}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
@@ -1924,6 +2281,21 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <span style={{color:"#d0d0c8"}}><strong>{l.qty} × {l.category}</strong> / {l.size} — to <strong>{l.borrower}</strong></span>
                     {l.note && <span style={{color:"#888"}}> · {l.note}</span>}
                     <div style={{color:"#555",fontSize:11,marginTop:2}}>Booked out {l.createdAt} by {l.cashier}</div>
+                  </div>
+                ))}
+              </div>
+          }
+
+          <p className="sec-label" style={{marginBottom:10,marginTop:28}}>Credit Notes Issued — Reference</p>
+          {summary.creditNotes.length===0
+            ? <p style={{color:"#444",fontSize:14}}>No credit notes issued.</p>
+            : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {summary.creditNotes.map(c=>(
+                  <div key={c.id} style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                    <span className="mono" style={{color:"#e67e22",fontWeight:700}}>{c.id}</span>
+                    <span style={{color:"#d0d0c8"}}> · {c.client.name} · − {fmt(c.total)} by {c.method} · vs {c.saleId}</span>
+                    {c.reason && <span style={{color:"#888"}}> · {c.reason}</span>}
+                    <div style={{color:"#555",fontSize:11,marginTop:2}}>{c.date} · processed by {c.cashier}</div>
                   </div>
                 ))}
               </div>
@@ -1972,7 +2344,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
               {l:"UNITS DEPLETED",v:String(result.totals.depleted)},
               {l:"UNITS RECORDED SOLD",v:String(result.totals.sold)},
               {l:"VARIANCE",v:String(result.totals.variance),bad:result.totals.variance!==0},
-              {l:"REVENUE (NEW SALES)",v:fmt(result.revenue)},
+              {l:result.refundTotal>0?"NET REVENUE (AFTER REFUNDS)":"REVENUE (NEW SALES)",v:fmt(result.netRevenue)},
             ].map(c=>(
               <div key={c.l} style={{background:"#141414",border:`1px solid ${c.bad?"#c0392b":"#2a2a2a"}`,borderRadius:8,padding:"18px 20px"}}>
                 <div style={{fontSize:11,fontWeight:700,letterSpacing:2,color:"#666",textTransform:"uppercase",marginBottom:6}}>{c.l}</div>
@@ -1990,7 +2362,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
           <p className="sec-label" style={{marginBottom:10}}>By Payment Method</p>
           <div style={{overflowX:"auto",marginBottom:28}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Method","Invoices","Units","Revenue"].map((h,i)=>(
+              <thead><tr>{["Method","Invoices","Units","Revenue","Refunds","Net"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>0?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -2001,6 +2373,8 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.invoices}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{c.units}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#c9a84c",fontWeight:700}}>{fmt(c.revenue)}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:c.refunds>0?"#e67e22":"#444"}}>{c.refunds>0?"− "+fmt(c.refunds):"—"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#27ae60",fontWeight:700}}>{fmt(c.revenue-c.refunds)}</td>
                   </tr>
                 ))}
               </tbody>
@@ -2068,6 +2442,21 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                 ))}
               </div>
           }
+
+          <p className="sec-label" style={{marginBottom:10,marginTop:28}}>Credit Notes Issued — Reference</p>
+          {result.newRefunds.length===0
+            ? <p style={{color:"#444",fontSize:14}}>No credit notes issued.</p>
+            : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                {result.newRefunds.map(c=>(
+                  <div key={c.id} style={{background:"#141414",border:"1px solid #e67e22",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                    <span className="mono" style={{color:"#e67e22",fontWeight:700}}>{c.id}</span>
+                    <span style={{color:"#d0d0c8"}}> · {c.client.name} · − {fmt(c.total)} by {c.method} · vs {c.saleId}</span>
+                    {c.reason && <span style={{color:"#888"}}> · {c.reason}</span>}
+                    <div style={{color:"#555",fontSize:11,marginTop:2}}>{c.date} · processed by {c.cashier}</div>
+                  </div>
+                ))}
+              </div>
+          }
         </>
       )}
       </>
@@ -2086,6 +2475,8 @@ export default function App() {
   const [sales, setSales]         = useState([]);
   const [adjLog, setAdjLog]       = useState([]);
   const [loans, setLoans]         = useState([]);
+  const [refunds, setRefunds]     = useState([]);
+  const [creditNote, setCreditNote] = useState(null);
   const [invoice, setInvoice]     = useState(null);
   const [loading, setLoading]     = useState(SUPABASE_CONFIGURED);
   const [online, setOnline]       = useState(navigator.onLine);
@@ -2107,12 +2498,14 @@ export default function App() {
     if (!SUPABASE_CONFIGURED || !event) return;
     try {
       const data = await fetchAllData(event.id);
-      setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog); setLoans(data.loans);
-      saveCache(event.id, data.stock, data.sales, data.adjLog, data.loans);
+      setStock(data.stock); setSales(data.sales); setAdjLog(data.adjLog); setLoans(data.loans); setRefunds(data.refunds);
+      saveCache(event.id, data.stock, data.sales, data.adjLog, data.loans, data.refunds);
       setOnline(true);
+      return data;
     } catch (err) {
       console.error("Refresh failed", err);
       setOnline(false);
+      return null;
     }
   }, [event]);
 
@@ -2159,7 +2552,7 @@ export default function App() {
     setLoading(true);
     // Show last-known cached data for THIS event immediately, before the live fetch returns.
     const cached = loadCache(event.id);
-    if (cached.stock) { setStock(cached.stock); setSales(cached.sales||[]); setAdjLog(cached.adjLog||[]); setLoans(cached.loans||[]); }
+    if (cached.stock) { setStock(cached.stock); setSales(cached.sales||[]); setAdjLog(cached.adjLog||[]); setLoans(cached.loans||[]); setRefunds(cached.refunds||[]); }
     let cancelled = false;
     (async () => { await refreshAll(); if (!cancelled) setLoading(false); })();
     const unsub = subscribeRealtime(event.id, debounce(refreshAll, 400));
@@ -2190,7 +2583,7 @@ export default function App() {
       `adjustment history for "${event.name}" — not other events on this system. Every device ` +
       `currently working on this event will see it cleared. Use this to start fresh. Continue?`
     )) return;
-    downloadBackup(stock, sales, adjLog, loans, event);
+    downloadBackup(stock, sales, adjLog, loans, event, refunds);
     try {
       await wipeAllDataRPC(event.id);
       await refreshAll();
@@ -2239,11 +2632,33 @@ export default function App() {
     }
   };
 
+  // Refunds need a live connection — unlike a sale they are not queued offline,
+  // because a credit note must be checked against what has already been refunded.
+  const issueRefund = async (sale, items, method, reason) => {
+    try {
+      const cnId = await createRefundRPC(event.id, sale.id, user.username, items, method, reason);
+      const data = await refreshAll();
+      const cn = data?.refunds.find(r=>r.id===cnId);
+      toast(`✓ Credit note ${cnId} issued`, "success");
+      return { ok:true, cn };
+    } catch (err) {
+      const m = String(err?.message||"");
+      let msg = "Couldn't issue the refund — check your connection and try again";
+      if (m.includes("REFUND_EXCEEDS_SOLD")) msg = `That's more than was sold — ${m.split("REFUND_EXCEEDS_SOLD:")[1]||""}`;
+      else if (m.includes("ITEM_NOT_ON_INVOICE")) msg = "One of those items isn't on this invoice";
+      else if (m.includes("EVENT_MISMATCH")) msg = "That invoice belongs to a different event";
+      else if (m && m!=="Failed to fetch") msg = m;
+      toast(`✗ ${msg}`, "error");
+      return { ok:false };
+    }
+  };
+  const viewCreditNote = cn => { setCreditNote(cn); setScreen("creditnote"); };
+
   const onSaleComplete = inv => { setInvoice(inv); setScreen("invoice"); };
   const onViewInvoice  = inv => { setInvoice(inv); setScreen("invoice"); };
-  const navTo = s => { setScreen(s); if(s!=="invoice") setInvoice(null); };
+  const navTo = s => { setScreen(s); if(s!=="invoice") setInvoice(null); if(s!=="creditnote") setCreditNote(null); };
 
-  const activeNav = screen==="invoice"?"sales":screen;
+  const activeNav = (screen==="invoice"||screen==="creditnote")?"sales":screen;
 
   if (showHero) return (
     <>
@@ -2292,21 +2707,25 @@ export default function App() {
     <>
       <TestBanner/>
       <Header user={user} screen={activeNav} setScreen={navTo} onLogout={logout} stock={stock} sales={sales}
-        adjLog={adjLog} loans={loans} onResetAll={resetAllData} online={online} queueCount={queueCount}
+        adjLog={adjLog} loans={loans} refunds={refunds} onResetAll={resetAllData} online={online} queueCount={queueCount}
         syncIssuesCount={syncIssues.length} event={event} onSwitchEvent={switchEvent}/>
       <Toasts toasts={toasts} dismiss={dismiss}/>
       {screen==="pos" &&
         <POSScreen stock={stock} user={user} toast={toast} onCompleteSale={completeSaleFlow} onSaleComplete={onSaleComplete}/>}
       {screen==="invoice" && invoice &&
-        <InvoiceView invoice={invoice} onBack={()=>{setInvoice(null);setScreen("pos");}}/>}
+        <InvoiceView invoice={invoice} onBack={()=>{setInvoice(null);setScreen("pos");}}
+          isAdmin={user.role==="admin"} refunds={refunds} onIssueRefund={issueRefund} onViewCreditNote={viewCreditNote}/>}
+      {screen==="creditnote" && creditNote &&
+        <CreditNoteView cn={creditNote} onBack={()=>{setCreditNote(null);setScreen("sales");}}/>}
       {screen==="stock" && user.role==="admin" &&
         <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll} eventId={event.id}/>}
       {screen==="reconcile" && user.role==="admin" &&
-        <Reconcile stock={stock} sales={sales} loans={loans} toast={toast} event={event}/>}
+        <Reconcile stock={stock} sales={sales} loans={loans} refunds={refunds} toast={toast} event={event}/>}
       {screen==="sales" && !invoice &&
-        <SalesScreen sales={sales} onView={onViewInvoice}/>}
+        <SalesScreen sales={sales} refunds={refunds} onView={onViewInvoice} onViewCreditNote={viewCreditNote}/>}
       {screen==="sales" && invoice &&
-        <InvoiceView invoice={invoice} onBack={()=>setInvoice(null)}/>}
+        <InvoiceView invoice={invoice} onBack={()=>setInvoice(null)}
+          isAdmin={user.role==="admin"} refunds={refunds} onIssueRefund={issueRefund} onViewCreditNote={viewCreditNote}/>}
     </>
   );
 }

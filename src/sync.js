@@ -47,15 +47,18 @@ export async function deleteEventPermanentlyRPC(eventId) {
 export async function fetchAllData(eventId) {
   const [{ data: products, error: pErr }, { data: variants, error: vErr },
          { data: sales, error: sErr }, { data: saleItems, error: siErr },
-         { data: adjustments, error: aErr }, { data: loans, error: lErr }] = await Promise.all([
+         { data: adjustments, error: aErr }, { data: loans, error: lErr },
+         { data: refunds, error: rErr }, { data: refundItems, error: riErr }] = await Promise.all([
     supabase.from("products").select("*").eq("event_id", eventId).order("created_at", { ascending: true }),
     supabase.from("variants").select("*").eq("event_id", eventId),
     supabase.from("sales").select("*").eq("event_id", eventId).order("created_at", { ascending: true }),
     supabase.from("sale_items").select("*").eq("event_id", eventId),
     supabase.from("adjustments").select("*").eq("event_id", eventId).order("created_at", { ascending: false }),
     supabase.from("loans").select("*").eq("event_id", eventId).order("created_at", { ascending: false }),
+    supabase.from("refunds").select("*").eq("event_id", eventId).order("created_at", { ascending: false }),
+    supabase.from("refund_items").select("*").eq("event_id", eventId),
   ]);
-  if (pErr||vErr||sErr||siErr||aErr||lErr) throw (pErr||vErr||sErr||siErr||aErr||lErr);
+  if (pErr||vErr||sErr||siErr||aErr||lErr||rErr||riErr) throw (pErr||vErr||sErr||siErr||aErr||lErr||rErr||riErr);
 
   const stock = (products||[]).map(p => ({
     id: p.id, category: p.category, sku: p.sku,
@@ -86,7 +89,20 @@ export async function fetchAllData(eventId) {
     resolvedAt: l.resolved_at ? new Date(l.resolved_at).toLocaleString("en-ZA") : null,
   }));
 
-  return { stock, sales: salesOut, adjLog, loans: loansOut };
+  const refundItemsById = {};
+  (refundItems||[]).forEach(i => {
+    (refundItemsById[i.refund_id] = refundItemsById[i.refund_id]||[]).push({
+      productId:i.product_id, category:i.category, sku:i.sku, size:i.size,
+      qty:i.qty, price:Number(i.price), restock:i.restock,
+    });
+  });
+  const refundsOut = (refunds||[]).map(r => ({
+    id:r.id, saleId:r.sale_id, date:r.date, cashier:r.cashier, client:r.client||{},
+    method:r.refund_method||"cash", reason:r.reason||"", total:Number(r.total),
+    createdAt:r.created_at, items: refundItemsById[r.id]||[],
+  }));
+
+  return { stock, sales: salesOut, adjLog, loans: loansOut, refunds: refundsOut };
 }
 
 // ── Realtime — refetch-on-change, filtered to one event (simple, robust) ───
@@ -99,6 +115,8 @@ export function subscribeRealtime(eventId, onChange) {
     .on("postgres_changes", { event:"*", schema:"public", table:"sale_items", filter }, onChange)
     .on("postgres_changes", { event:"*", schema:"public", table:"adjustments", filter }, onChange)
     .on("postgres_changes", { event:"*", schema:"public", table:"loans", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"refunds", filter }, onChange)
+    .on("postgres_changes", { event:"*", schema:"public", table:"refund_items", filter }, onChange)
     .subscribe();
   return () => supabase.removeChannel(channel);
 }
@@ -140,6 +158,16 @@ export async function completeSaleRPC(eventId, cashier, client, items, subtotal,
   });
   if (error) throw error;
   return data; // new invoice id
+}
+
+export async function createRefundRPC(eventId, saleId, cashier, items, method, reason) {
+  const { data, error } = await supabase.rpc("create_refund", {
+    p_event_id: eventId, p_sale_id: saleId, p_cashier: cashier,
+    p_items: items.map(i=>({ product_id:i.productId, category:i.category, size:i.size, qty:i.qty, restock:i.restock })),
+    p_method: method, p_reason: reason,
+  });
+  if (error) throw error;
+  return data; // new credit note id
 }
 
 export async function wipeAllDataRPC(eventId) {
