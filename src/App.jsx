@@ -1492,7 +1492,7 @@ function Adjustments({ stock, user, toast, log, refreshAll }) {
   const [note, setNote] = useState("");
   const [saving, setSaving] = useState(false);
 
-  const adjTypes = [{key:"Receive",icon:"➕"},{key:"Write-off",icon:"➖"},{key:"Free Issue",icon:"🎁"},{key:"Return",icon:"↩"}];
+  const adjTypes = [{key:"Receive",icon:"➕"},{key:"Write-off",icon:"➖"},{key:"Free Issue",icon:"🎁"},{key:"Return",icon:"↩",label:"Customer Return"}];
   const selProd = stock.find(p=>p.id===prodId);
   const selVariant = selProd?.variants.find(v=>v.size===size);
 
@@ -1539,10 +1539,16 @@ function Adjustments({ stock, user, toast, log, refreshAll }) {
           <div style={{display:"flex",flexWrap:"wrap",gap:8,marginTop:4}}>
             {adjTypes.map(t=>(
               <button key={t.key} className={`pill-btn ${adjType===t.key?"active":""}`} onClick={()=>setAdjType(t.key)}>
-                {t.icon} {t.key}
+                {t.icon} {t.label||t.key}
               </button>
             ))}
           </div>
+          {adjType==="Return" && (
+            <p style={{fontSize:12,color:"#e67e22",marginTop:10,maxWidth:380}}>
+              Customer Return ADDS stock back (a customer brought an item back). To send unsold stock back to the
+              supplier, use the <strong>📤 Return to Supplier</strong> tab instead.
+            </p>
+          )}
         </div>
         <div style={{marginBottom:14}}>
           <label className="sec-label">Quantity</label>
@@ -1571,7 +1577,186 @@ function Adjustments({ stock, user, toast, log, refreshAll }) {
                     <span style={{color:e.delta>0?"#27ae60":"#c0392b",fontWeight:700,marginLeft:8}}>
                       {e.delta>0?"+":""}{e.delta}
                     </span>
-                    <span style={{color:"#666",marginLeft:4}}>({e.adjType}{e.note?" — "+e.note:""})</span>
+                    <span style={{color:"#666",marginLeft:4}}>({e.adjType==="Return"?"Customer Return":e.adjType}{e.note?" — "+e.note:""})</span>
+                  </div>
+                  <div style={{color:"#555",fontSize:11,marginTop:2}}>by {e.cashier}</div>
+                </div>
+              ))}
+            </div>
+        }
+      </div>
+    </div>
+  );
+}
+
+// ─── Return to Supplier (consignment stock going back out) ───────────────────
+const SUPPLIER_RETURN = "Supplier Return";
+
+function SupplierReturn({ stock, user, toast, adjLog, refreshAll }) {
+  const blank = () => ({ prodId:"", size:"", qty:"" });
+  const [lines, setLines] = useState([blank()]);
+  const [supplier, setSupplier] = useState("");
+  const [ref, setRef] = useState("");
+  const [note, setNote] = useState("");
+  const [saving, setSaving] = useState(false);
+  const [lastNote, setLastNote] = useState(null);
+
+  const setLine = (i, patch) => setLines(ls => ls.map((l,idx)=> idx===i ? { ...l, ...patch } : l));
+  const history = (adjLog||[]).filter(a => a.adjType===SUPPLIER_RETURN);
+
+  const submit = async () => {
+    if (!supplier.trim()) { toast("✗ Enter the supplier name","error"); return; }
+    const filled = lines.filter(l => l.prodId || l.size || l.qty);
+    if (filled.length===0) { toast("✗ Add at least one item","error"); return; }
+    const resolved = [];
+    for (const l of filled) {
+      const prod = stock.find(p=>p.id===l.prodId);
+      const variant = prod?.variants.find(v=>v.size===l.size);
+      const n = parseInt(l.qty);
+      if (!prod || !variant?.id || !n || n<1) { toast("✗ Every line needs a product, size and quantity","error"); return; }
+      resolved.push({ prod, variant, n });
+    }
+    // Same item listed twice → check the combined total against stock.
+    const totals = {};
+    for (const r of resolved) totals[r.variant.id] = (totals[r.variant.id]||0) + r.n;
+    for (const r of resolved) {
+      if (totals[r.variant.id] > r.variant.qty) {
+        toast(`✗ Only ${r.variant.qty} × ${r.prod.category} ${r.variant.size} on hand — can't return ${totals[r.variant.id]}`,"error");
+        return;
+      }
+    }
+    const fullNote = `To ${supplier.trim()}${ref.trim()?" · Ref "+ref.trim():""}${note.trim()?" · "+note.trim():""}`;
+    setSaving(true);
+    const done = [];
+    try {
+      for (const r of resolved) {
+        await applyAdjustmentRPC(r.variant.id, -r.n, SUPPLIER_RETURN, fullNote, user.username);
+        done.push({ category:r.prod.category, size:r.variant.size, qty:r.n });
+      }
+      await refreshAll();
+      setLastNote({ supplier:supplier.trim(), ref:ref.trim(), note:note.trim(), items:done, by:user.username, when:new Date() });
+      toast(`✓ ${done.reduce((s,d)=>s+d.qty,0)} units booked out to ${supplier.trim()}`,"success");
+      setLines([blank()]); setRef(""); setNote("");
+    } catch (err) {
+      console.error("Supplier return failed:", err);
+      await refreshAll();
+      if (done.length>0) {
+        setLastNote({ supplier:supplier.trim(), ref:ref.trim(), note:note.trim(), items:done, by:user.username, when:new Date() });
+        toast(`⚠ Only ${done.length} of ${resolved.length} lines were saved — check the log below, then re-enter the rest`,"error");
+        setLines([blank()]);
+      } else if (isStockError(err)) toast("✗ Not enough stock for one of the lines","error");
+      else toast(`✗ Couldn't save — ${err?.message || "check your connection and try again"}`,"error");
+    }
+    setSaving(false);
+  };
+
+  const printNote = n => {
+    if (!n) return;
+    const rows = n.items.map(i=>`<tr><td>${i.category}</td><td>${i.size}</td><td class="right">${i.qty}</td></tr>`).join("");
+    const totalUnits = n.items.reduce((s,i)=>s+i.qty,0);
+    const html = `<!DOCTYPE html><html><head><title>Stock Return Note</title><style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:Arial,sans-serif;background:#fff;color:#111;padding:40px;max-width:800px;margin:0 auto;}
+table{width:100%;border-collapse:collapse;margin:16px 0 28px;}
+th{font-size:11px;font-weight:700;text-transform:uppercase;letter-spacing:1px;padding:6px 8px;border-bottom:2px solid #111;text-align:left;}
+td{padding:8px;border-bottom:1px solid #ddd;font-size:13px;}
+.right{text-align:right;}
+h1{font-size:22px;margin-bottom:4px;}
+.sub{font-size:12px;color:#555;margin-bottom:22px;line-height:1.5;}
+.sig{display:flex;gap:40px;margin-top:50px;}
+.sig div{flex:1;border-top:1px solid #111;padding-top:6px;font-size:12px;}
+</style></head><body>
+<h1>IMPI RMS (Pty) Ltd — Stock Return Note</h1>
+<p class="sub">10 Kosmos Crescent, Rynoue AH, Roodeplaat, Pretoria · 012 543 0640 · info@impi-secure.co.za<br>Co. Reg 2017/099360/07 · PSIRA 2689596</p>
+<p style="margin-bottom:4px;"><strong>Returned to (supplier):</strong> ${n.supplier}</p>
+${n.ref?`<p style="margin-bottom:4px;"><strong>Reference:</strong> ${n.ref}</p>`:""}
+<p style="margin-bottom:4px;"><strong>Date:</strong> ${n.when.toLocaleString("en-ZA")}</p>
+<p style="margin-bottom:4px;"><strong>Booked out by:</strong> ${n.by}</p>
+${n.note?`<p style="margin-bottom:4px;"><strong>Note:</strong> ${n.note}</p>`:""}
+<p style="margin:14px 0 4px;font-size:13px;">Unsold consignment stock returned to the supplier:</p>
+<table><thead><tr><th>Item</th><th>Size</th><th class="right">Qty</th></tr></thead>
+<tbody>${rows}<tr><td colspan="2" style="font-weight:700;">Total units</td><td class="right" style="font-weight:700;">${totalUnits}</td></tr></tbody></table>
+<div class="sig"><div>Released by (IMPI) — name &amp; signature</div><div>Received by (supplier) — name, signature &amp; date</div></div>
+<script>window.print();<\/script>
+</body></html>`;
+    const w = window.open("","_blank");
+    w.document.write(html); w.document.close();
+  };
+
+  return (
+    <div className="adj-grid" style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:24}}>
+      <div>
+        <p style={{fontSize:13,color:"#888",marginBottom:16,maxWidth:480}}>
+          Use this when unsold (consignment) stock goes <strong>back to the supplier</strong>. It takes the units
+          <strong> out</strong> of stock and is kept separate from sales, so Reconcile will not flag it as missing.
+        </p>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Supplier</label>
+          <input className="field-input" placeholder="Supplier name" value={supplier} onChange={e=>setSupplier(e.target.value)} />
+        </div>
+        <div style={{marginBottom:14}}>
+          <label className="sec-label">Reference (optional)</label>
+          <input className="field-input" placeholder="e.g. collection no. / delivery note no." value={ref} onChange={e=>setRef(e.target.value)} />
+        </div>
+        <label className="sec-label">Items going back</label>
+        {lines.map((l,i)=>{
+          const prod = stock.find(p=>p.id===l.prodId);
+          return (
+            <div key={i} style={{display:"flex",gap:6,marginBottom:8,flexWrap:"wrap"}}>
+              <select className="field-input" style={{flex:"2 1 140px"}} value={l.prodId} onChange={e=>setLine(i,{prodId:e.target.value,size:""})}>
+                <option value="">Product…</option>
+                {stock.map(p=><option key={p.id} value={p.id}>{p.category}</option>)}
+              </select>
+              <select className="field-input" style={{flex:"1.4 1 110px"}} value={l.size} onChange={e=>setLine(i,{size:e.target.value})} disabled={!prod}>
+                <option value="">Size…</option>
+                {prod?.variants.map(v=><option key={v.size} value={v.size}>{v.size} ({v.qty})</option>)}
+              </select>
+              <input className="field-input" style={{flex:"0.8 1 70px",fontFamily:"'JetBrains Mono'"}} type="number" min="1" placeholder="Qty"
+                value={l.qty} onChange={e=>setLine(i,{qty:e.target.value})} />
+              {lines.length>1 && (
+                <button onClick={()=>setLines(ls=>ls.filter((_,idx)=>idx!==i))}
+                  style={{background:"#222",color:"#c0392b",border:"1px solid #333",borderRadius:4,padding:"0 12px",fontWeight:700}}>✕</button>
+              )}
+            </div>
+          );
+        })}
+        <button onClick={()=>setLines(ls=>[...ls,blank()])}
+          style={{background:"#222",color:"#d0d0c8",border:"1px solid #333",borderRadius:4,padding:"8px 14px",fontSize:13,fontWeight:700,marginBottom:14}}>
+          ＋ Add another item
+        </button>
+        <div style={{marginBottom:20}}>
+          <label className="sec-label">Note (optional)</label>
+          <input className="field-input" placeholder="e.g. unsold after Seamless Africa 2026" value={note} onChange={e=>setNote(e.target.value)} />
+        </div>
+        <button onClick={submit} disabled={saving}
+          style={{background:saving?"#555":"linear-gradient(135deg,#FFD700,#c9a84c)",color:saving?"#999":"#000",fontWeight:900,
+            fontSize:16,letterSpacing:2,textTransform:"uppercase",padding:"13px 28px",border:"none",borderRadius:4}}>
+          {saving?"Booking out…":"Book Out to Supplier"}
+        </button>
+        {lastNote && (
+          <div style={{marginTop:18,background:"#141414",border:"1px solid #27ae60",borderRadius:6,padding:"12px 14px",fontSize:13,color:"#d0d0c8"}}>
+            ✓ Booked out to <strong>{lastNote.supplier}</strong> — {lastNote.items.reduce((s,i)=>s+i.qty,0)} units.
+            <div style={{marginTop:8}}>
+              <button onClick={()=>printNote(lastNote)}
+                style={{background:"#222",color:"#d0d0c8",border:"1px solid #333",borderRadius:4,padding:"8px 14px",fontSize:13,fontWeight:700}}>
+                🖨 Print / Save Return Note
+              </button>
+            </div>
+          </div>
+        )}
+      </div>
+      <div>
+        <p className="sec-label" style={{marginBottom:10}}>Returned to Supplier — Log</p>
+        {history.length===0
+          ? <p style={{color:"#444",fontSize:14}}>Nothing returned to a supplier yet.</p>
+          : <div style={{display:"flex",flexDirection:"column",gap:6}}>
+              {history.map(e=>(
+                <div key={e.id} style={{background:"#141414",border:"1px solid #2a2a2a",borderRadius:6,padding:"10px 14px",fontSize:13}}>
+                  <div className="mono" style={{color:"#666",fontSize:11,marginBottom:3}}>{e.ts}</div>
+                  <div style={{color:"#d0d0c8"}}>
+                    <strong>{e.product}</strong> / {e.size}
+                    <span style={{color:"#c0392b",fontWeight:700,marginLeft:8}}>{e.delta}</span>
+                    <span style={{color:"#666",marginLeft:4}}>({e.note})</span>
                   </div>
                   <div style={{color:"#555",fontSize:11,marginTop:2}}>by {e.cashier}</div>
                 </div>
@@ -1826,7 +2011,7 @@ function LoanBorrow({ stock, user, toast, loans, refreshAll }) {
 function StockScreen({ stock, user, toast, adjLog, loans, refreshAll, eventId }) {
   const [tab, setTab] = useState("view");
   const tabs = [{key:"view",label:"📦 View Stock"},{key:"add",label:"➕ Add Product"},{key:"adjust",label:"🔧 Adjustments"},
-    {key:"take",label:"📋 Stock Take"},{key:"loan",label:"🤝 Loan / Borrow"}];
+    {key:"take",label:"📋 Stock Take"},{key:"loan",label:"🤝 Loan / Borrow"},{key:"supplier",label:"📤 Return to Supplier"}];
   return (
     <div style={{padding:24}}>
       <div className="stock-tab-bar" style={{display:"flex",gap:4,marginBottom:24,borderBottom:"1px solid #2a2a2a",overflowX:"auto"}}>
@@ -1844,6 +2029,7 @@ function StockScreen({ stock, user, toast, adjLog, loans, refreshAll, eventId })
       {tab==="adjust" &&<Adjustments stock={stock} user={user} toast={toast} log={adjLog} refreshAll={refreshAll} />}
       {tab==="take"   &&<StockTake stock={stock} user={user} toast={toast} refreshAll={refreshAll} />}
       {tab==="loan"   &&<LoanBorrow stock={stock} user={user} toast={toast} loans={loans} refreshAll={refreshAll} />}
+      {tab==="supplier"&&<SupplierReturn stock={stock} user={user} toast={toast} adjLog={adjLog} refreshAll={refreshAll} />}
     </div>
   );
 }
@@ -1945,7 +2131,16 @@ function flattenStock(stockArr) {
   return map;
 }
 
-function buildReconciliation(openingData, closingStock, closingSales, closingRefunds) {
+const supplierReturnMap = entries => {
+  const m = {};
+  (entries||[]).filter(a=>a.adjType===SUPPLIER_RETURN).forEach(a => {
+    const k = `${a.product}::${a.size}`;
+    m[k] = (m[k]||0) + Math.abs(a.delta);
+  });
+  return m;
+};
+
+function buildReconciliation(openingData, closingStock, closingSales, closingRefunds, closingAdjLog) {
   const openMap = flattenStock(openingData.stock);
   const closeMap = flattenStock(closingStock);
   const openIds = new Set((openingData.sales||[]).map(s=>s.id));
@@ -1980,6 +2175,12 @@ function buildReconciliation(openingData, closingStock, closingSales, closingRef
   });
   const refundTotal = newRefunds.reduce((s,r)=>s+r.total,0);
 
+  // Stock returned to the supplier since the opening backup — explains a drop
+  // in stock that is not a sale, so it must not show as a variance.
+  const openAdjIds = new Set((openingData.adjLog||[]).map(a=>a.id));
+  const newReturns = (closingAdjLog||[]).filter(a => a.adjType===SUPPLIER_RETURN && !openAdjIds.has(a.id));
+  const returnedMap = supplierReturnMap(newReturns);
+
   const allKeys = new Set([...Object.keys(openMap), ...Object.keys(closeMap), ...Object.keys(soldMap)]);
   const rows = [...allKeys].map(k => {
     const o = openMap[k], c = closeMap[k];
@@ -1987,21 +2188,22 @@ function buildReconciliation(openingData, closingStock, closingSales, closingRef
     const openQty = o?o.qty:0, closeQty = c?c.qty:0;
     const depleted = openQty-closeQty;
     const sold = soldMap[k]||0;
-    return { category:ref.category, sku:ref.sku, size:ref.size, openQty, closeQty, depleted, sold, variance:depleted-sold };
+    const returned = returnedMap[`${ref.category}::${ref.size}`]||0;
+    return { category:ref.category, sku:ref.sku, size:ref.size, openQty, closeQty, depleted, sold, returned, variance:depleted-sold-returned };
   }).sort((a,b)=> a.category.localeCompare(b.category) || a.size.localeCompare(b.size));
 
   const totals = rows.reduce((t,r)=>({
-    depleted:t.depleted+r.depleted, sold:t.sold+r.sold, variance:t.variance+r.variance
-  }), {depleted:0,sold:0,variance:0});
+    depleted:t.depleted+r.depleted, sold:t.sold+r.sold, returned:t.returned+r.returned, variance:t.variance+r.variance
+  }), {depleted:0,sold:0,returned:0,variance:0});
   const revenue = newSales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, refundTotal, netRevenue: revenue-refundTotal, newRefunds, cashierMap, paymentMap, newSalesCount: newSales.length };
+  return { rows, totals, revenue, refundTotal, netRevenue: revenue-refundTotal, newRefunds, newReturns, cashierMap, paymentMap, newSalesCount: newSales.length };
 }
 
 // Straight "where do things stand right now" report — every sale currently on
 // record, cash/card and per-staff breakdowns, and current stock on hand.
 // Needs no opening backup, since it's not computing a before/after variance.
-function buildSummary(stock, sales, loans, refunds) {
+function buildSummary(stock, sales, loans, refunds, adjLog) {
   const soldMap = {};
   const cashierMap = {};
   const paymentMap = { cash:{units:0,revenue:0,invoices:0,refunds:0}, card:{units:0,revenue:0,invoices:0,refunds:0} };
@@ -2027,6 +2229,9 @@ function buildSummary(stock, sales, loans, refunds) {
   });
   const refundTotal = (refunds||[]).reduce((s,r)=>s+r.total,0);
 
+  const returnedMap = supplierReturnMap(adjLog);
+  const supplierReturns = (adjLog||[]).filter(a=>a.adjType===SUPPLIER_RETURN);
+
   const openLoans = (loans||[]).filter(l=>l.status==="out");
   const loanMap = {};
   openLoans.forEach(l => {
@@ -2037,17 +2242,17 @@ function buildSummary(stock, sales, loans, refunds) {
   const rows = [];
   stock.forEach(p => p.variants.forEach(v => {
     const k = stockKey({category:p.category, sku:p.sku, size:v.size});
-    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, refunded: refundMap[k]||0, remaining: v.qty, onLoan: loanMap[k]||0 });
+    rows.push({ category:p.category, sku:p.sku, size:v.size, sold: soldMap[k]||0, refunded: refundMap[k]||0, returned: returnedMap[`${p.category}::${v.size}`]||0, remaining: v.qty, onLoan: loanMap[k]||0 });
   }));
   rows.sort((a,b)=> a.category.localeCompare(b.category) || a.size.localeCompare(b.size));
 
-  const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining, onLoan:t.onLoan+r.onLoan }), {sold:0,remaining:0,onLoan:0});
+  const totals = rows.reduce((t,r)=>({ sold:t.sold+r.sold, remaining:t.remaining+r.remaining, onLoan:t.onLoan+r.onLoan, returned:t.returned+r.returned }), {sold:0,remaining:0,onLoan:0,returned:0});
   const revenue = sales.reduce((s,sale)=>s+sale.total,0);
 
-  return { rows, totals, revenue, refundTotal, refundCount:(refunds||[]).length, creditNotes:(refunds||[]), cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
+  return { rows, totals, revenue, refundTotal, refundCount:(refunds||[]).length, creditNotes:(refunds||[]), supplierReturns, cashierMap, paymentMap, invoiceCount: sales.length, openLoans };
 }
 
-function Reconcile({ stock, sales, loans, refunds, toast, event }) {
+function Reconcile({ stock, sales, loans, refunds, adjLog, toast, event }) {
   const [mode, setMode] = useState("summary"); // "summary" (no file needed) | "variance" (opening vs closing)
   const [opening, setOpening] = useState(null);
   const [openingName, setOpeningName] = useState("");
@@ -2074,14 +2279,15 @@ function Reconcile({ stock, sales, loans, refunds, toast, event }) {
   const closingSales = closingSource==="live" ? sales : closing?.sales;
   const ready = opening && closingStock && closingSales;
   const closingRefunds = closingSource==="live" ? refunds : (closing?.refunds||[]);
-  const result = ready ? buildReconciliation(opening, closingStock, closingSales, closingRefunds) : null;
-  const summary = mode==="summary" ? buildSummary(stock, sales, loans, refunds) : null;
+  const closingAdjLog = closingSource==="live" ? adjLog : (closing?.adjLog||[]);
+  const result = ready ? buildReconciliation(opening, closingStock, closingSales, closingRefunds, closingAdjLog) : null;
+  const summary = mode==="summary" ? buildSummary(stock, sales, loans, refunds, adjLog) : null;
   const openLoansList = (loans||[]).filter(l=>l.status==="out");
 
   const printSummary = () => {
     if (!summary) return;
     const rowsHtml = summary.rows.map(r=>
-      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.refunded||"—"}</td><td class="right">${r.onLoan}</td><td class="right">${r.remaining}</td></tr>`).join("");
+      `<tr><td>${r.category}</td><td>${r.size}</td><td class="right">${r.sold}</td><td class="right">${r.refunded||"—"}</td><td class="right">${r.returned||"—"}</td><td class="right">${r.onLoan}</td><td class="right">${r.remaining}</td></tr>`).join("");
     const creditHtml = summary.creditNotes.map(c=>
       `<tr><td>${c.id}</td><td>${c.saleId}</td><td>${c.date}</td><td>${c.client.name||""}</td><td>${c.method==="card"?"Card":"Cash"}</td><td>${c.cashier}</td><td>${c.reason||""}</td><td class="right">${fmt(c.total)}</td></tr>`).join("");
     const cashierHtml = Object.entries(summary.cashierMap).map(([name,c])=>
@@ -2104,6 +2310,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <h2>As at ${new Date().toLocaleString("en-ZA")}</h2>
 <p style="margin-bottom:4px;"><strong>Invoices:</strong> ${summary.invoiceCount}</p>
 <p style="margin-bottom:4px;"><strong>Total units sold:</strong> ${summary.totals.sold}</p>
+<p style="margin-bottom:4px;"><strong>Total units returned to supplier:</strong> ${summary.totals.returned}</p>
 <p style="margin-bottom:4px;"><strong>Total units currently on loan:</strong> ${summary.totals.onLoan}</p>
 <p style="margin-bottom:4px;"><strong>Total units remaining on hand:</strong> ${summary.totals.remaining}</p>
 <p style="margin-bottom:${summary.refundCount>0?4:20}px;"><strong>Total revenue:</strong> ${fmt(summary.revenue)}</p>
@@ -2115,7 +2322,7 @@ ${summary.refundCount>0?`<p style="margin-bottom:4px;"><strong>Refunds (credit n
 <table><thead><tr><th>Cashier</th><th class="right">Invoices</th><th class="right">Units</th><th class="right">Revenue</th></tr></thead>
 <tbody>${cashierHtml}</tbody></table>
 <h2 style="font-weight:700;color:#111;">Stock sold vs. refunded vs. on loan vs. on hand</h2>
-<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">Refunded</th><th class="right">On Loan</th><th class="right">Remaining</th></tr></thead>
+<table><thead><tr><th>Category</th><th>Size</th><th class="right">Sold</th><th class="right">Refunded</th><th class="right">Returned to Supplier</th><th class="right">On Loan</th><th class="right">Remaining</th></tr></thead>
 <tbody>${rowsHtml}</tbody></table>
 ${summary.openLoans.length>0?`<h2 style="font-weight:700;color:#111;">Currently on loan — reference</h2>
 <table><thead><tr><th>Category</th><th>Size</th><th class="right">Qty</th><th>Borrower</th><th>Booked Out</th><th>Note</th></tr></thead>
@@ -2133,7 +2340,7 @@ ${summary.creditNotes.length>0?`<h2 style="font-weight:700;color:#111;">Credit n
     if (!result) return;
     const rowsHtml = result.rows.map(r=>`<tr style="${r.variance!==0?'background:#ffeeee;':''}">
       <td>${r.category}</td><td>${r.size}</td><td class="right">${r.openQty}</td><td class="right">${r.closeQty}</td>
-      <td class="right">${r.depleted}</td><td class="right">${r.sold}</td>
+      <td class="right">${r.depleted}</td><td class="right">${r.sold}</td><td class="right">${r.returned||"—"}</td>
       <td class="right" style="font-weight:700;${r.variance!==0?'color:#c0392b;':''}">${r.variance}</td></tr>`).join("");
     const cashierHtml = Object.entries(result.cashierMap).map(([name,c])=>
       `<tr><td>${name}</td><td class="right">${c.invoices}</td><td class="right">${c.units}</td><td class="right">${fmt(c.revenue)}</td></tr>`).join("");
@@ -2153,6 +2360,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <h2>Opening: ${openingName || "n/a"} (${opening.exportedAt||""}) &nbsp;→&nbsp; Closing: ${closingSource==="live"?"Live data at "+new Date().toISOString():closingName}</h2>
 <p style="margin-bottom:4px;"><strong>Total units depleted from stock:</strong> ${result.totals.depleted}</p>
 <p style="margin-bottom:4px;"><strong>Total units recorded as sold:</strong> ${result.totals.sold}</p>
+<p style="margin-bottom:4px;"><strong>Units returned to supplier:</strong> ${result.totals.returned}</p>
 <p style="margin-bottom:4px;"><strong>Variance:</strong> ${result.totals.variance} ${result.totals.variance!==0?"⚠ investigate":"✓ matches"}</p>
 <p style="margin-bottom:20px;"><strong>Revenue recorded:</strong> ${fmt(result.revenue)}</p>
 <h2 style="font-weight:700;color:#111;">By payment method</h2>
@@ -2163,7 +2371,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 <tbody>${cashierHtml}</tbody></table>
 <h2 style="font-weight:700;color:#111;">By product / size</h2>
 <table><thead><tr><th>Category</th><th>Size</th><th class="right">Opening</th><th class="right">Closing</th>
-<th class="right">Depleted</th><th class="right">Recorded Sold</th><th class="right">Variance</th></tr></thead>
+<th class="right">Depleted</th><th class="right">Recorded Sold</th><th class="right">To Supplier</th><th class="right">Variance</th></tr></thead>
 <tbody>${rowsHtml}</tbody></table>
 <script>window.print();<\/script>
 </body></html>`;
@@ -2189,6 +2397,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
               {l:"INVOICES",v:String(summary.invoiceCount)},
               {l:"UNITS SOLD",v:String(summary.totals.sold)},
               {l:"ON LOAN",v:String(summary.totals.onLoan),loan:summary.totals.onLoan>0},
+              {l:"RETURNED TO SUPPLIER",v:String(summary.totals.returned)},
               {l:"UNITS ON HAND",v:String(summary.totals.remaining)},
               {l:"TOTAL REVENUE",v:fmt(summary.revenue)},
               ...(summary.refundCount>0?[{l:"REFUNDS",v:"− "+fmt(summary.refundTotal),loan:true},{l:"NET REVENUE",v:fmt(summary.revenue-summary.refundTotal)}]:[]),
@@ -2248,10 +2457,10 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
             </table>
           </div>
 
-          <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. On Loan vs. On Hand</p>
+          <p className="sec-label" style={{marginBottom:10}}>Stock Sold vs. Returned vs. On Loan vs. On Hand</p>
           <div style={{overflowX:"auto",marginBottom:28}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Category","Size","Sold","Refunded","On Loan","Remaining"].map((h,i)=>(
+              <thead><tr>{["Category","Size","Sold","Refunded","To Supplier","On Loan","Remaining"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>1?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -2262,6 +2471,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td style={{padding:"8px",borderBottom:"1px solid #222",color:"#888"}}>{r.size}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.sold}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:r.refunded>0?"#e67e22":"#444"}}>{r.refunded||"—"}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:r.returned>0?"#3498db":"#444"}}>{r.returned||"—"}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
                       color:r.onLoan>0?"#e67e22":"#444",fontWeight:r.onLoan>0?700:400}}>{r.onLoan||"—"}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",
@@ -2339,10 +2549,11 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
 
       {result && (
         <>
-          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(4,1fr)",gap:16,marginBottom:24}}>
+          <div className="stats-grid" style={{display:"grid",gridTemplateColumns:"repeat(auto-fit,minmax(150px,1fr))",gap:16,marginBottom:24}}>
             {[
               {l:"UNITS DEPLETED",v:String(result.totals.depleted)},
               {l:"UNITS RECORDED SOLD",v:String(result.totals.sold)},
+              {l:"RETURNED TO SUPPLIER",v:String(result.totals.returned)},
               {l:"VARIANCE",v:String(result.totals.variance),bad:result.totals.variance!==0},
               {l:result.refundTotal>0?"NET REVENUE (AFTER REFUNDS)":"REVENUE (NEW SALES)",v:fmt(result.netRevenue)},
             ].map(c=>(
@@ -2404,7 +2615,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
           <p className="sec-label" style={{marginBottom:10}}>By Product / Size</p>
           <div style={{overflowX:"auto"}}>
             <table style={{width:"100%",borderCollapse:"collapse"}}>
-              <thead><tr>{["Category","Size","Opening","Closing","Depleted","Recorded Sold","Variance"].map((h,i)=>(
+              <thead><tr>{["Category","Size","Opening","Closing","Depleted","Recorded Sold","To Supplier","Variance"].map((h,i)=>(
                 <th key={h} style={{fontSize:11,fontWeight:700,textTransform:"uppercase",letterSpacing:1,
                   color:"#666",padding:"8px",borderBottom:"2px solid #333",textAlign:i>1?"right":"left"}}>{h}</th>
               ))}</tr></thead>
@@ -2417,6 +2628,7 @@ h2{font-size:14px;color:#555;margin-bottom:20px;font-weight:400;}
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.closeQty}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.depleted}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:"#888"}}>{r.sold}</td>
+                    <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",color:r.returned>0?"#3498db":"#444"}}>{r.returned||"—"}</td>
                     <td className="mono" style={{padding:"8px",borderBottom:"1px solid #222",textAlign:"right",fontWeight:700,
                       color:r.variance!==0?"#e74c3c":"#27ae60"}}>{r.variance}</td>
                   </tr>
@@ -2720,7 +2932,7 @@ export default function App() {
       {screen==="stock" && user.role==="admin" &&
         <StockScreen stock={stock} user={user} toast={toast} adjLog={adjLog} loans={loans} refreshAll={refreshAll} eventId={event.id}/>}
       {screen==="reconcile" && user.role==="admin" &&
-        <Reconcile stock={stock} sales={sales} loans={loans} refunds={refunds} toast={toast} event={event}/>}
+        <Reconcile stock={stock} sales={sales} loans={loans} refunds={refunds} adjLog={adjLog} toast={toast} event={event}/>}
       {screen==="sales" && !invoice &&
         <SalesScreen sales={sales} refunds={refunds} onView={onViewInvoice} onViewCreditNote={viewCreditNote}/>}
       {screen==="sales" && invoice &&
@@ -2729,4 +2941,3 @@ export default function App() {
     </>
   );
 }
-
